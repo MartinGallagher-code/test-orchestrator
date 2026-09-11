@@ -223,6 +223,43 @@ it is a wrong answer rather than a missing one. The report says so, and
 was found. That is not conditional on the run going well — it is exactly
 when cleanup matters most.
 
+### What the job reads, and what it says
+
+The job's stdin is `/dev/null` unless the plan names a file, so a command
+that waits on input fails at once instead of hanging until the timeout
+and reporting nothing. `--stdin NAME` feeds it one — the file ships in
+the payload like everything else the job needs:
+
+```bash
+tx gen --servers servers.txt --payload ./bench --run ./bench \
+       --stdin workload.txt
+```
+
+`tx check` catches a `stdin` the payload does not carry, before any ssh:
+forgetting to ship it fails identically on all forty hosts, so it is
+worth finding without contacting one.
+
+Its stdout and stderr go to files of their own — a benchmark's stdout is
+usually its result and its stderr usually its complaints, so merging them
+would mean parsing one out of the other. Both come back whole with the
+collection, and **the last few lines of stderr ride back inside the
+record**, so the report answers *why* rather than only *which*:
+
+```text
+  FAILED    2 host(s) exited non-zero:
+            db03             exit 1 after 12.1s
+                               fio: io_u error on file /dev/nvme1n1: Input/output error
+```
+
+A job that never started at all is its own outcome, not a host stuck on
+`RUNNING`:
+
+```text
+  NEVER RAN 1 host(s) could not start the job at all:
+            web12            [Errno 2] No such file or directory: 'bash'
+            nothing ran there, so there is no result to read as a failure.
+```
+
 ### What the job is told
 
 Every job runs under `bash`, in the working directory, with:
@@ -235,6 +272,8 @@ Every job runs under `bash`, in the working directory, with:
 | `TX_TAG` | The run's tag, which leads every collected filename. |
 | `TX_RUN_ID` | The run's stamp, shared by every host in one start. |
 | `TX_HOSTS` | The whole host list, with `--peers`. |
+
+and `stdin` from the plan's `stdin =` file, or `/dev/null`.
 
 ```bash
 tx gen --servers servers.txt --run './shard.sh $TX_INDEX $TX_NHOSTS' --peers
@@ -273,8 +312,10 @@ to use this, and the second run quietly replacing the first is not a
 result anybody wants to find later.
 
 **What comes back:** everything under `TX_OUT`, plus each host's
-`stdout`, `stderr`, `setup.log`, `teardown.log` and the run's own JSON
-record — always. `--collect GLOB` adds anything else you want, evaluated
+`stdout`, `stderr`, `setup.log`, `teardown.log`, `agent.log` and the
+run's own JSON record — always. The agent's log is in that list because
+it is where anything the agent could not turn into a record ends up, and
+a run that went wrong is exactly when you need it. `--collect GLOB` adds anything else you want, evaluated
 on the host.
 
 Nothing a remote host says is used as a local path. Names are rebuilt
@@ -324,6 +365,7 @@ setup = make -s
 teardown =
 payload = ./bench
 timeout = 600
+stdin = workload.txt
 collect = *.csv
 tag = bench
 remote_dir = /var/tmp/tx

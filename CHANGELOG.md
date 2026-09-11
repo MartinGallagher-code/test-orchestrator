@@ -13,6 +13,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The job can be fed a file on stdin.** `stdin = NAME` in the plan
+  (`tx gen --stdin NAME`) hands the job a file from the working
+  directory, which ships in the payload like everything else it needs.
+  Without one the job still reads `/dev/null`, so a command that waits
+  on input fails at once rather than hanging until the timeout and
+  reporting nothing. `tx check` catches a `stdin` the payload does not
+  carry before any ssh -- forgetting to ship it fails identically on
+  every host, so it is worth finding without contacting one.
+
+- **The report says why a host failed, not only which.** The last few
+  lines of a job's stderr now ride back inside the run record, so
+  `tx summarize` prints them under the failing host instead of leaving
+  you to collect the run and go looking. The whole stderr still comes
+  back untouched; the record carries a bounded tail, read from the end
+  of the file so a job that wrote a gigabyte of warnings is not loaded
+  into memory to find out it failed on the last line.
+
+- **`agent.log` is collected with the results.** It is where anything
+  the agent could not turn into a record ends up, which makes a run that
+  went wrong exactly when it is needed -- and `tx logs` being a separate
+  command was no help to somebody reading a collection later.
+
 - **`tx run --batch N` covers a fleet bigger than what can run at once.**
   Some jobs cannot go fleet-wide in one go -- a licence with a seat
   count, a filer with only so much throughput, a power envelope, a test
@@ -43,6 +65,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stops instead.
 
 ### Fixed
+
+- **A job that could not start left its host reading `RUNNING` for
+  ever.** The record is written before the job is launched, so a launch
+  that threw -- no `bash`, a working directory that went away -- escaped
+  with the record still saying `running`: a machine doing nothing,
+  reported as one still working. The only explanation went to the
+  agent's log, which `tx collect` did not bring back, so the run's
+  stderr was genuinely lost. It is now its own outcome, `NEVER RAN`,
+  with the reason in the record, in the collected stderr, and in
+  `tx status` and `tx summarize`.
 
 - **The start spread no longer claims waves were simultaneous with each
   other.** Each host's offset is measured against its *own* wave's
