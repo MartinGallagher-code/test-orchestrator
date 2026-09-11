@@ -63,11 +63,18 @@ jobs:
 
       # Hosted runners no longer offer a 3.6 toolchain, so use the
       # container. Checkout runs on the host, so there is no node20 issue.
+      #
+      # Nothing is installed into the image. python:3.6-slim is long EOL,
+      # so its bullseye security Release file has expired and `apt-get
+      # update` exits 100 -- and the suite does not need anything apt
+      # would provide: bash, tar, find and coreutils are all Essential
+      # and already there. procps is not required either; tx's pgrep
+      # paths are fallbacks for when a pid file is missing, and the suite
+      # passes with pgrep and pkill absent.
       - name: Run the suite under real Python 3.6
         run: |
           docker run --rm -v "$PWD:/w" -w /w python:3.6-slim \
-            bash -euxc 'apt-get update -qq && apt-get install -y -qq procps \
-              && ./tests/check_python_compat.sh && ./tests/run_tests.sh'
+            bash -euxc './tests/check_python_compat.sh && ./tests/run_tests.sh'
 
   docs:
     name: docs build
