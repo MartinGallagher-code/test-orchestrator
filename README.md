@@ -92,9 +92,10 @@ agents to install, no packages, no root. Key-based SSH must already work
 | `tx clean` | Stop, then delete everything. No trace left. |
 
 And six more when you want them: `tx run` (all of the above in one
-shot), `tx check` (will this plan work? no ssh needed), `tx doctor` (is
-the fleet ready?), `tx stop` (end the job, keep what it made), `tx logs`
-(collect the agents' own logs), and `tx hints` (goal → command).
+shot, and `--batch N` to cover the fleet a few hosts at a time), `tx
+check` (will this plan work? no ssh needed), `tx doctor` (is the fleet
+ready?), `tx stop` (end the job, keep what it made), `tx logs` (collect
+the agents' own logs), and `tx hints` (goal → command).
 
 ---
 
@@ -143,6 +144,53 @@ producing a staggered start:
 A host that cannot be armed does not leave the others running: the whole
 fleet is stood back down, because a run that began on 39 hosts of 40 is
 not the run you asked for.
+
+---
+
+## Coverage: the whole fleet, a few hosts at a time
+
+Some jobs cannot run fleet-wide at once — a licence with a seat count, a
+filer that only has so much throughput, a power envelope, a test fixture
+that handles twenty machines. The answer is not to give up the
+simultaneity but to narrow what it applies to:
+
+```bash
+tx run --batch 20 -d results        # 200 hosts, 10 waves of 20
+```
+
+Each wave is armed for its own instant and is as simultaneous as any
+whole-fleet run. The waves then march through the fleet in plan order
+until it is used up — and **everything lands in one directory**, because
+the point of covering the fleet is to end with one set of results for
+all of it:
+
+```text
+[tx] coverage: 200 hosts in 10 waves of at most 20 -> results/
+
+[tx] === wave 1 of 10: web01 web02 web03 web04 web05 web06 web07 web08 ... ===
+...
+tx -- ./bench.sh   [bench]
+      200 of 200 hosts finished: 198 passed, 2 failed, 0 timed out
+      covered 200 of 200 hosts in 10 waves of at most 20
+
+  START     spread 47ms within each wave (worst +0.031s off the armed instant)
+            waves are simultaneous in themselves, not with each other -- that is what --batch trades away
+```
+
+That last line is the trade, stated rather than hidden: hosts within a
+wave started together, hosts in different waves did not. The report says
+so, because the spread is measured against each host's *own* wave's
+instant.
+
+`--batch` is not `--jobs`. `--jobs` is how many ssh connections are open
+at once — a property of the machine you drive from. `--batch` is how many
+hosts are *running the job* at once, which is the thing a seat count or a
+filer actually constrains.
+
+By default a wave that fails does not stop the sweep: one unreachable
+rack should not cost the other nine their coverage. `--stop-on-fail`
+stops instead, and the hosts nobody got to are reported as `NOT REACHED`
+rather than quietly counted as passes.
 
 ---
 
