@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "test-orchestrator"
+version = "1.0.0"
+description = "Run one benchmark or test on a whole fleet at once, and get the results back"
+readme = "README.md"
+requires-python = ">=3.6"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Martin J. Gallagher" }]
+maintainers = [{ name = "Martin J. Gallagher" }]
+keywords = [
+    "benchmark",
+    "fleet",
+    "orchestration",
+    "ssh",
+    "distributed-testing",
+    "load-testing",
+    "performance",
+    "synchronized",
+    "test-harness",
+    "sysadmin",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Information Technology",
+    "Operating System :: POSIX",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Benchmark",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: System :: Systems Administration",
+]
+
+# Standard library only, on the orchestrator and on every host. The agent
+# is copied to the servers by scp and run there, so a dependency here
+# would become a dependency on every machine in the fleet.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/MartinGallagher-code/test-orchestrator"
+Repository = "https://github.com/MartinGallagher-code/test-orchestrator"
+Issues = "https://github.com/MartinGallagher-code/test-orchestrator/issues"
+Changelog = "https://github.com/MartinGallagher-code/test-orchestrator/blob/main/CHANGELOG.md"
+
+[project.scripts]
+tx = "test_orchestrator.tx:main"
+test-orchestrator = "test_orchestrator.tx:main"
+
+[tool.setuptools]
+packages = ["test_orchestrator"]

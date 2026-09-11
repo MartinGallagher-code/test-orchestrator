@@ -1,0 +1,2054 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Martin J. Gallagher
+"""tx -- run one benchmark on a whole fleet at once, and bring the results back.
+
+One file. One command per thing you want to do. Every host runs the same
+job, started at the same instant, and everything it produced comes back
+into one directory whose names say which machine each file came from.
+
+    tx gen --servers servers.txt --payload ./bench --run ./bench.sh
+                                               # 1. build plan.ini
+    tx start                                   # 2. deploy + start together
+    tx status                                  # 3. running? finished? how?
+    tx collect                                 # 4. results, named by host
+    tx summarize                               # 5. who passed, who was slow
+    tx clean                                   # 6. remove every trace
+
+`tx run` does steps 2-5 in one shot and waits for the fleet to finish.
+`tx hints` turns "I want X" into the command that gets you X.
+
+Everything the run needs lives in plan.ini -- the host list, the command,
+what to ship with it, the timeout and what to collect -- so no other
+command needs those flags again. Edit the file and re-run `tx start`.
+
+What it is for
+  You have a benchmark, a stress test, a conformance suite or a one-off
+  reproduction script, and you need it run on forty machines rather than
+  one. Doing that by hand is forty scp commands, forty ssh sessions you
+  have to start close enough together to mean anything, and forty sets of
+  results that all land on top of each other because they are all called
+  `results.json`.
+
+  This is the non-network sibling of `mx` and `iperf_orchestrator`. Those
+  two generate traffic and measure the fabric. This one does not care
+  what the job is: it ships it, starts it everywhere at one instant,
+  waits, brings back what it produced, and removes itself.
+
+At the same instant, and able to prove it
+  Starting forty ssh sessions takes seconds, and a benchmark that starts
+  on host 1 five seconds before host 40 is not a fleet measurement -- it
+  is forty measurements of different moments. So `tx start` does not
+  start anything: it *arms* every host with a wall-clock instant a few
+  seconds out, and each agent sleeps until then.
+
+  That makes the claim depend on the hosts' clocks agreeing, so the
+  deploy measures each host's offset against this machine and refuses a
+  fleet that disagrees by more than --max-skew. Every agent records the
+  time it actually began, and `tx summarize` reports the spread across
+  the fleet -- so "at the same time" is a measured number in the report,
+  not a hope.
+
+Results that stay apart
+  One directory per collection, and everything in it is told apart by
+  its *name* rather than by where it sits:
+
+      tx-20260911-201500/bench~web01~out~results.json
+      tx-20260911-201500/bench~web02~out~results.json
+      tx-20260911-201500/bench~web02~stdout
+
+  Rebuilding each host's directory tree locally reads well and greps
+  badly. The command you actually want next is `grep -l FAIL *`, or
+  `jq . *results.json`, and both want one directory of distinctly-named
+  files, not forty identical paths under forty host directories.
+
+Python 3.6+, standard library only, on the orchestrator and on every host.
+"""
+
+import argparse
+import base64
+import configparser
+import errno
+import io
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+VERSION = "1.0.0"
+
+DEFAULT_PLAN = "plan.ini"
+DEFAULT_SERVERS = "servers.txt"
+DEFAULT_REMOTE_DIR = "/var/tmp/tx"
+DEFAULT_TIMEOUT = 3600.0
+DEFAULT_JOBS = 64
+
+# How far ahead of now the synchronised start is armed. Every host has to
+# be contacted, the agent has to be launched, and the launch has to have
+# happened *before* the instant arrives -- so this is the ssh fan-out's
+# budget. It grows with the fleet in `arm_delay` below.
+DEFAULT_START_IN = 5.0
+
+# A fleet whose clocks disagree by more than this cannot be started
+# together in any meaningful sense, so the deploy refuses rather than
+# producing a run whose "simultaneous" is a fiction.
+DEFAULT_MAX_SKEW = 1.0
+
+# Files the agent always writes, and which are therefore always collected.
+# They are the run's own record, as opposed to whatever the job produced.
+REPORT_NAME = "run.json"
+STDOUT_NAME = "stdout"
+STDERR_NAME = "stderr"
+SETUP_LOG = "setup.log"
+TEARDOWN_LOG = "teardown.log"
+PID_NAME = "agent.pid"
+LOG_NAME = "agent.log"
+OUT_NAME = "out"
+ALWAYS = (REPORT_NAME, STDOUT_NAME, STDERR_NAME, SETUP_LOG, TEARDOWN_LOG)
+
+# The separator between the parts of a collected file's name. `~` is legal
+# in a filename everywhere, needs no shell quoting, and does not occur in
+# ordinary paths -- so a name can be read back apart unambiguously.
+FLAT_SEP = "~"
+
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
+
+# The pgrep pattern is bracketed so the very shell running it is not
+# itself a match: that shell's command line contains the literal
+# "[t]x.py agent", which the regex "tx.py agent" does not match.
+PGREP = "pgrep -f '[t]x[.]py agent'"
+PKILL = "pkill -%s -f '[t]x[.]py agent'"
+
+
+def _env(name, default):
+    v = os.environ.get(name)
+    return v if v else default
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def die(msg, code=2):
+    sys.stderr.write("tx: %s\n" % msg)
+    sys.exit(code)
+
+
+def log(msg):
+    sys.stdout.write("%s\n" % msg)
+    sys.stdout.flush()
+
+
+def fmt_secs(s):
+    if s is None:
+        return "?"
+    if s < 1:
+        return "%dms" % round(s * 1000)
+    if s < 60:
+        return "%.1fs" % s
+    if s < 3600:
+        return "%dm%02ds" % (int(s) // 60, int(s) % 60)
+    return "%dh%02dm" % (int(s) // 3600, (int(s) % 3600) // 60)
+
+
+def fmt_bytes(n):
+    for unit, size in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if n >= size:
+            return "%.1f%s" % (float(n) / size, unit)
+    return "%dB" % n
+
+
+def b64(text):
+    """Text as base64, for anything that has to cross a shell untouched."""
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def unb64(text):
+    return base64.b64decode(text.encode("ascii")).decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# The plan
+# ---------------------------------------------------------------------------
+#
+# One file describes the whole run, the way matrix.csv does for mx: the
+# job, what ships with it, and the hosts it runs on. Every command reads
+# it, so no command but `gen` needs those flags.
+
+PLAN_KEYS = ("run", "setup", "teardown", "payload", "timeout", "collect",
+             "tag", "remote_dir")
+
+
+class Plan(object):
+    __slots__ = ("path", "hosts", "addrs", "run", "setup", "teardown",
+                 "payload", "timeout", "collect", "tag", "remote_dir")
+
+    def __init__(self, path, hosts, addrs, run, setup, teardown, payload,
+                 timeout, collect, tag, remote_dir):
+        self.path = path
+        self.hosts = hosts
+        self.addrs = addrs
+        self.run = run
+        self.setup = setup
+        self.teardown = teardown
+        self.payload = payload
+        self.timeout = timeout
+        self.collect = collect
+        self.tag = tag
+        self.remote_dir = remote_dir
+
+
+def parse_token(tok):
+    """`name`, `name=addr` or a bare address. Returns (name, addr).
+
+    A name that is not an address is what every report, every collected
+    filename and every error message uses, so a fleet can be renamed
+    without the results changing shape.
+    """
+    tok = tok.strip()
+    if not tok:
+        return None, None
+    if "=" in tok:
+        name, addr = tok.split("=", 1)
+        name, addr = name.strip(), addr.strip()
+        if not name or not addr:
+            return None, None
+        return name, addr
+    return tok, tok
+
+
+TAG_RE = re.compile(r"[^A-Za-z0-9._+-]+")
+
+
+def clean_tag(tag):
+    """A tag reduced to something safe as part of a filename.
+
+    The tag is the one part of a collected name the caller writes freely,
+    so it is the one part that could carry a slash and quietly mean a
+    directory.
+    """
+    cleaned = TAG_RE.sub("-", (tag or "").strip()).strip("-")
+    return cleaned or "tx"
+
+
+def default_tag(run_cmd):
+    """A tag for a job nobody named: the command's own first word.
+
+    `--run ./fio-seq.sh` becomes `fio-seq.sh`, which is what somebody
+    reading the results directory later would have called it anyway.
+    """
+    first = (run_cmd or "").strip().split()
+    if not first:
+        return "tx"
+    return clean_tag(first[0].rsplit("/", 1)[-1])
+
+
+def load_plan(path):
+    if not os.path.isfile(path):
+        die("plan not found: %s  (make one with: tx gen --servers %s "
+            "--run './bench.sh')" % (path, DEFAULT_SERVERS))
+    cp = configparser.RawConfigParser()
+    # Case matters in host names and in nothing else configparser touches,
+    # so stop it from lowercasing keys.
+    cp.optionxform = str
+    try:
+        with open(path) as fh:
+            text = fh.read()
+        if hasattr(cp, "read_string"):
+            cp.read_string(text)
+        else:                                       # pragma: no cover
+            cp.readfp(io.StringIO(text))
+    except configparser.Error as exc:
+        die("%s: %s" % (path, exc))
+
+    if not cp.has_section("job") or not cp.has_section("hosts"):
+        die("%s: needs a [job] and a [hosts] section -- regenerate it with "
+            "`tx gen`" % path)
+
+    def get(key, default=""):
+        if cp.has_option("job", key):
+            return cp.get("job", key).strip()
+        return default
+
+    for key in cp.options("job"):
+        if key not in PLAN_KEYS:
+            die("%s: unknown key %r in [job] -- known keys are: %s"
+                % (path, key, ", ".join(PLAN_KEYS)))
+
+    run = get("run")
+    if not run:
+        die("%s: [job] run= is empty -- there is nothing to run" % path)
+
+    try:
+        timeout = float(get("timeout", str(DEFAULT_TIMEOUT)))
+    except ValueError:
+        die("%s: bad timeout=%r" % (path, get("timeout")))
+    if timeout <= 0:
+        die("%s: timeout must be positive; a job with no bound is a fleet "
+            "nobody can get back" % path)
+
+    hosts, addrs = [], {}
+    for name in cp.options("hosts"):
+        addr = cp.get("hosts", name).strip() or name
+        if name in addrs:
+            die("%s: duplicate host %r" % (path, name))
+        hosts.append(name)
+        addrs[name] = addr
+    if not hosts:
+        die("%s: [hosts] is empty" % path)
+
+    collect = [p for p in get("collect").split() if p]
+    return Plan(path, hosts, addrs, run, get("setup"), get("teardown"),
+                get("payload"), timeout, collect,
+                clean_tag(get("tag") or default_tag(run)),
+                get("remote_dir", DEFAULT_REMOTE_DIR))
+
+
+def _ini_value(text):
+    """A value as configparser will read it back.
+
+    A benchmark command is quite often several lines. configparser joins
+    a value's *indented* continuation lines with newlines and treats an
+    unindented one as the next key, so writing the command out verbatim
+    would silently truncate it at the first newline -- and a truncated
+    command is a wrong run on every host at once.
+    """
+    return (text or "").replace("\n", "\n\t")
+
+
+def write_plan(path, tokens, run, setup, teardown, payload, timeout,
+               collect, tag, remote_dir):
+    out = sys.stdout if path == "-" else open(path, "w")
+    try:
+        out.write("# tx plan v%s -- one job, run on every host at the same "
+                  "instant.\n" % VERSION.split(".")[0])
+        out.write("# Edit this file and re-run `tx start`; nothing else "
+                  "needs those flags again.\n")
+        out.write("\n[job]\n")
+        out.write("# The command. It runs under bash in the working "
+                  "directory, with the\n"
+                  "# payload unpacked around it and $TX_OUT naming where "
+                  "results should go.\n")
+        out.write("run = %s\n" % _ini_value(run))
+        out.write("\n# Run before the job on each host (build, install, warm "
+                  "a cache). A host\n"
+                  "# whose setup fails does not run the job, and says so.\n")
+        out.write("setup = %s\n" % _ini_value(setup))
+        out.write("\n# Run after the job, pass or fail, so a host is left as "
+                  "it was found.\n")
+        out.write("teardown = %s\n" % _ini_value(teardown))
+        out.write("\n# A file or directory shipped to every host and "
+                  "unpacked into the working\n"
+                  "# directory: the benchmark itself, its data, whatever it "
+                  "needs.\n")
+        out.write("payload = %s\n" % payload)
+        out.write("\n# Seconds before a host's job is killed. Not optional: "
+                  "a job with no\n# bound is a fleet nobody can get back.\n")
+        out.write("timeout = %g\n" % timeout)
+        out.write("\n# Extra things to collect, as globs relative to the "
+                  "working directory.\n"
+                  "# Everything under out/ and the run's own record come "
+                  "back regardless.\n")
+        out.write("collect = %s\n" % " ".join(collect))
+        out.write("\n# Leads every collected file's name, so several runs "
+                  "can share a directory.\n")
+        out.write("tag = %s\n" % tag)
+        out.write("\n# The working directory on each host. `tx clean` "
+                  "deletes exactly this.\n")
+        out.write("remote_dir = %s\n" % remote_dir)
+        out.write("\n[hosts]\n")
+        out.write("# name = address. The name is what reports and collected "
+                  "filenames use.\n")
+        for tok in tokens:
+            name, addr = parse_token(tok)
+            out.write("%s = %s\n" % (name, addr))
+    finally:
+        if out is not sys.stdout:
+            out.close()
+
+
+def read_server_list(path):
+    if not os.path.isfile(path):
+        die("server list not found: %s" % path)
+    tokens = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            # `reachable`'s output is "host  OK  1.2ms"; take the first
+            # field so its output can be piped straight in.
+            tokens.append(line.split()[0])
+    if not tokens:
+        die("%s: no hosts in it" % path)
+    return tokens
+
+
+# ---------------------------------------------------------------------------
+# The fleet
+# ---------------------------------------------------------------------------
+
+class Fleet(object):
+    def __init__(self, plan, args):
+        self.plan = plan
+        self.user = args.user
+        self.jobs = max(1, args.jobs)
+        self.dir = getattr(args, "remote_dir", "") or plan.remote_dir
+        self.python = args.python
+        self.ssh = (args.ssh or "ssh").split()
+        self.scp = (args.scp or "scp").split()
+        self.dry_run = getattr(args, "dry_run", False)
+
+    def target(self, host):
+        addr = self.plan.addrs[host]
+        return "%s@%s" % (self.user, addr) if self.user else addr
+
+    def rpath(self, name):
+        return "%s/%s" % (self.dir, name)
+
+    def sh(self, host, script, timeout=120):
+        """Run a shell snippet on one host. Returns (rc, output)."""
+        cmd = self.ssh + SSH_OPTS + [self.target(host), script]
+        return self._run(cmd, timeout)
+
+    def push(self, host, local_paths, remote_name=None, timeout=900):
+        dest = "%s:%s" % (self.target(host), self.rpath(remote_name or ""))
+        cmd = self.scp + SSH_OPTS + ["-q"] + list(local_paths) + [dest]
+        return self._run(cmd, timeout)
+
+    def pull(self, host, remote_name, local_path, timeout=900):
+        src = "%s:%s" % (self.target(host), self.rpath(remote_name))
+        cmd = self.scp + SSH_OPTS + ["-q", src, local_path]
+        return self._run(cmd, timeout)
+
+    def stream(self, host, script, timeout=900):
+        """Run a snippet and hand back its raw stdout as bytes.
+
+        Collection uses this: a tar stream is bytes, and decoding it as
+        text on the way past would corrupt every binary a job produced.
+        """
+        if self.dry_run:
+            return 0, b"", "DRY-RUN"
+        cmd = self.ssh + SSH_OPTS + [self.target(host), script]
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE,
+                                 stdin=subprocess.DEVNULL)
+            out, err = p.communicate(timeout=timeout)
+            return p.returncode, out or b"", (err or b"").decode(
+                "utf-8", "replace").strip()
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.communicate()
+            return 124, b"", "timed out after %ss" % timeout
+        except OSError as exc:
+            return 127, b"", str(exc)
+
+    def _run(self, cmd, timeout):
+        if self.dry_run:
+            return 0, "DRY-RUN %s" % " ".join(shlex.quote(c) for c in cmd)
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL,
+                                 universal_newlines=True)
+            out, _ = p.communicate(timeout=timeout)
+            return p.returncode, (out or "").strip()
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.communicate()
+            return 124, "timed out after %ss" % timeout
+        except OSError as exc:
+            return 127, str(exc)
+
+    def each(self, fn, label=None, quiet=False, hosts=None):
+        """Run fn(host) on every host, at most --jobs at a time.
+
+        fn returns (rc, text). Output is printed host-prefixed in plan
+        order rather than completion order, so two runs are diffable.
+        Returns the number of failures.
+        """
+        hosts = list(hosts) if hosts is not None else self.plan.hosts
+        if label:
+            log("[tx] %s on %d hosts" % (label, len(hosts)))
+        with ThreadPoolExecutor(max_workers=self.jobs) as pool:
+            results = list(pool.map(fn, hosts))
+        width = max(len(h) for h in hosts)
+        failed = []
+        for host, (rc, text) in zip(hosts, results):
+            if rc != 0:
+                failed.append(host)
+            if quiet and rc == 0:
+                continue
+            for line in (text or "").splitlines() or [""]:
+                log("  %-*s  %s" % (width, host, line))
+        if failed:
+            log("[tx] FAILED on %d/%d hosts: %s"
+                % (len(failed), len(hosts), " ".join(failed)))
+        return len(failed)
+
+    def gather(self, fn, hosts=None):
+        """each(), without printing: returns {host: (rc, text)}."""
+        hosts = list(hosts) if hosts is not None else self.plan.hosts
+        with ThreadPoolExecutor(max_workers=self.jobs) as pool:
+            results = list(pool.map(fn, hosts))
+        return dict(zip(hosts, results))
+
+
+def _agent_source():
+    """This file, resolved through any symlink -- it is what gets copied
+    to the hosts, so the fleet always runs exactly this version."""
+    return os.path.realpath(os.path.abspath(__file__))
+
+
+# ---------------------------------------------------------------------------
+# Clocks
+# ---------------------------------------------------------------------------
+
+def measure_skew(fleet, hosts=None):
+    """Each host's clock offset from this machine, in seconds.
+
+    Asking a host what time it is over ssh costs a round trip, so the
+    answer is already stale when it arrives. Halving the measured round
+    trip is the standard correction and is good to a few milliseconds --
+    far tighter than the skew that actually breaks a synchronised start,
+    which is whole seconds of untended clock drift.
+
+    Returns {host: (offset, rtt, error)}; offset is None if the host
+    could not be asked.
+    """
+    def one(host):
+        t0 = time.time()
+        rc, out = fleet.sh(host, "date +%s.%N", timeout=30)
+        t1 = time.time()
+        if rc != 0:
+            return None, t1 - t0, out or "could not read the clock"
+        try:
+            remote = float(out.strip().split()[0])
+        except (ValueError, IndexError):
+            return None, t1 - t0, "unreadable clock: %r" % out[:40]
+        # The reading was taken somewhere inside [t0, t1]; the midpoint is
+        # the best single guess, and the interval's width is the error bar.
+        return remote - (t0 + t1) / 2.0, t1 - t0, ""
+
+    return fleet.gather(one, hosts)
+
+
+def arm_delay(nhosts, floor):
+    """How far ahead to arm the start.
+
+    Every host must be contacted and its agent launched *before* the
+    instant arrives, or that host misses it and starts late. The fan-out
+    is bounded by --jobs, so the cost grows with the number of waves, not
+    with the fleet; a flat second per wave plus the floor has been enough,
+    and --start-in raises it when a slow fleet needs more.
+    """
+    return max(floor, floor + 0.5 * (nhosts / 32.0))
+
+
+# ---------------------------------------------------------------------------
+# The agent: what runs on each host
+# ---------------------------------------------------------------------------
+
+def _write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(obj, fh, sort_keys=True, indent=1)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def _run_phase(command, cwd, env, logpath, timeout):
+    """Run one phase (setup/teardown) and record what it said.
+
+    Both phases are bookkeeping around the job rather than the
+    measurement, so their output goes to one file each and only their
+    exit status reaches the report.
+    """
+    with open(logpath, "wb") as fh:
+        p = subprocess.Popen(["bash", "-c", command], cwd=cwd, env=env,
+                             stdout=fh, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL,
+                             start_new_session=True)
+        _RUNNING.append(p)
+        try:
+            p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(p)
+            p.communicate()
+            return 124
+        finally:
+            _RUNNING.remove(p)
+    return p.returncode
+
+
+def _kill_group(p):
+    """Kill the process *group*, not just the child.
+
+    A benchmark is almost always a shell script that starts other things.
+    Killing bash alone leaves its children running, holding the machine
+    and the files we are about to collect -- so the agent gives each
+    phase a session of its own and takes the whole group down.
+    """
+    try:
+        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+    except OSError:
+        try:
+            p.terminate()
+        except OSError:
+            pass
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if p.poll() is not None:
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+    except OSError:
+        try:
+            p.kill()
+        except OSError:
+            pass
+
+
+# The phase currently running, so a SIGTERM arriving from `tx stop` can
+# be carried down to it.
+_RUNNING = []
+
+
+def _forward_term(_signum, _frame):
+    """Take the job down with us.
+
+    `tx stop` kills the agent. The job is deliberately in a session of
+    its own -- that is what lets the agent kill a benchmark's whole tree
+    of children rather than just the shell at the top of it -- and the
+    price of that separation is that killing the agent does not reach it.
+    So the agent forwards the signal itself, and only then goes.
+    """
+    for p in list(_RUNNING):
+        _kill_group(p)
+    sys.exit(143)
+
+
+def cmd_agent(args):
+    """Run the job here, at the armed instant, and write down what happened.
+
+    This is the half of tx that lives on the servers. It is the same file
+    -- copied there by `tx start` -- so there is never a version of the
+    agent that is not the version of the orchestrator that deployed it.
+    """
+    signal.signal(signal.SIGTERM, _forward_term)
+    signal.signal(signal.SIGINT, _forward_term)
+    workdir = os.getcwd()
+    outdir = os.path.join(workdir, OUT_NAME)
+    try:
+        os.makedirs(outdir)
+    except OSError as exc:
+        if exc.errno != errno.EEXIST:
+            raise
+
+    run_cmd = unb64(args.run)
+    setup_cmd = unb64(args.setup) if args.setup else ""
+    teardown_cmd = unb64(args.teardown) if args.teardown else ""
+
+    env = os.environ.copy()
+    env["TX_HOST"] = args.host
+    env["TX_OUT"] = outdir
+    env["TX_TAG"] = args.tag
+    env["TX_RUN_ID"] = args.run_id
+    env["TX_INDEX"] = str(args.index)
+    env["TX_NHOSTS"] = str(args.nhosts)
+    if args.peers:
+        env["TX_HOSTS"] = unb64(args.peers)
+
+    report = {
+        "host": args.host,
+        "tag": args.tag,
+        "run_id": args.run_id,
+        "command": run_cmd,
+        "armed_for": args.at,
+        "index": args.index,
+        "nhosts": args.nhosts,
+        "agent_version": VERSION,
+        "uname": " ".join(os.uname()),
+        "setup_exit": None,
+        "teardown_exit": None,
+        "started_at": None,
+        "finished_at": None,
+        "duration": None,
+        "exit": None,
+        "timed_out": False,
+        "state": "setup",
+    }
+    _write_json(REPORT_NAME, report)
+
+    # Setup runs immediately, not at the armed instant: it is preparation,
+    # and a build or a package install would otherwise eat the very
+    # synchronisation it was scheduled around.
+    if setup_cmd:
+        rc = _run_phase(setup_cmd, workdir, env, SETUP_LOG,
+                        max(1.0, args.at - time.time() + args.timeout))
+        report["setup_exit"] = rc
+        if rc != 0:
+            report["state"] = "setup-failed"
+            _write_json(REPORT_NAME, report)
+            sys.stderr.write("tx agent: setup failed (exit %d); the job was "
+                             "not run\n" % rc)
+            return 1
+        _write_json(REPORT_NAME, report)
+
+    # Wait for the instant. Sleeping the whole delta in one call would
+    # ignore a clock the system steps while we wait, so re-read it.
+    report["state"] = "armed"
+    _write_json(REPORT_NAME, report)
+    while True:
+        remaining = args.at - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(remaining, 0.25))
+
+    started = time.time()
+    report["started_at"] = started
+    report["state"] = "running"
+    _write_json(REPORT_NAME, report)
+    # How far off the armed instant this host actually was. It is the
+    # measurement that makes "at the same time" checkable rather than
+    # claimed, so it is recorded even when it is tiny.
+    report["start_offset"] = started - args.at
+
+    fout = open(STDOUT_NAME, "wb")
+    ferr = open(STDERR_NAME, "wb")
+    try:
+        p = subprocess.Popen(["bash", "-c", run_cmd], cwd=workdir, env=env,
+                             stdout=fout, stderr=ferr,
+                             stdin=subprocess.DEVNULL,
+                             start_new_session=True)
+        _RUNNING.append(p)
+        try:
+            p.communicate(timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            report["timed_out"] = True
+            _kill_group(p)
+            p.communicate()
+        finally:
+            _RUNNING.remove(p)
+        rc = p.returncode
+    finally:
+        fout.close()
+        ferr.close()
+
+    report["finished_at"] = time.time()
+    report["duration"] = report["finished_at"] - started
+    report["exit"] = rc
+    report["state"] = "timeout" if report["timed_out"] else "done"
+    _write_json(REPORT_NAME, report)
+
+    # Teardown runs whether the job passed, failed or was killed: leaving
+    # a host as it was found is not conditional on the run going well.
+    if teardown_cmd:
+        report["teardown_exit"] = _run_phase(
+            teardown_cmd, workdir, env, TEARDOWN_LOG, args.timeout)
+        _write_json(REPORT_NAME, report)
+
+    return 0 if rc == 0 and not report["timed_out"] else 1
+
+
+# ---------------------------------------------------------------------------
+# Deploy
+# ---------------------------------------------------------------------------
+
+def _pack_payload(payload):
+    """The payload as one gzipped tar, in a temp file.
+
+    One transfer rather than `scp -r`: a recursive scp opens a channel
+    per file, which on a payload of a thousand small files is a thousand
+    round trips, and it silently follows symlinks out of the tree.
+    """
+    if not os.path.exists(payload):
+        die("payload not found: %s" % payload)
+    fd, path = tempfile.mkstemp(prefix="tx-payload-", suffix=".tar.gz")
+    os.close(fd)
+    tf = tarfile.open(path, "w:gz")
+    try:
+        if os.path.isdir(payload):
+            for name in sorted(os.listdir(payload)):
+                tf.add(os.path.join(payload, name), arcname=name)
+        else:
+            tf.add(payload, arcname=os.path.basename(payload))
+    finally:
+        tf.close()
+    return path
+
+
+def _deploy_script(rdir, has_payload):
+    # Single braces: this snippet is a *value* passed to the format call
+    # below, not a template itself, so doubling them would leave literal
+    # `{{` in the shell -- which bash reads as a command named `{{`,
+    # making the `exit 1` after it unconditional.
+    unpack = ""
+    if has_payload:
+        unpack = """
+tar xzf payload.tar.gz || { echo 'payload would not unpack'; exit 1; }
+rm -f payload.tar.gz
+"""
+    return """
+d={d}
+mkdir -p "$d" || {{ echo "cannot create $d"; exit 1; }}
+cd "$d" || exit 1
+if [ -f {pid} ] && kill -0 "$(cat {pid} 2>/dev/null)" 2>/dev/null; then
+    echo 'a job is already running here -- tx stop first'; exit 1
+fi
+rm -rf {out} {report} {stdout} {stderr} {setuplog} {teardownlog} {log} {pid}
+{unpack}
+echo deployed
+""".format(d=shlex.quote(rdir), pid=PID_NAME, out=OUT_NAME,
+           report=REPORT_NAME, stdout=STDOUT_NAME, stderr=STDERR_NAME,
+           setuplog=SETUP_LOG, teardownlog=TEARDOWN_LOG, log=LOG_NAME,
+           unpack=unpack)
+
+
+def _start_script(fleet, plan, args, host, at, index, run_id):
+    agent = os.path.basename(_agent_source())
+    flags = [
+        "agent",
+        "--host", host,
+        "--at", "%.3f" % at,
+        "--timeout", "%g" % plan.timeout,
+        "--tag", plan.tag,
+        "--run-id", run_id,
+        "--index", str(index),
+        "--nhosts", str(len(plan.hosts)),
+        "--run", b64(plan.run),
+    ]
+    if plan.setup:
+        flags += ["--setup", b64(plan.setup)]
+    if plan.teardown:
+        flags += ["--teardown", b64(plan.teardown)]
+    if args.peers:
+        flags += ["--peers", b64(" ".join(plan.hosts))]
+
+    # The agent is backgrounded as a *simple* command with all three
+    # descriptors redirected: $! is then the agent's own pid, and nothing
+    # is left holding ssh's channel open -- background an `A && B` list
+    # instead and ssh hangs until the agent exits.
+    launch = ("nohup %s %s %s < /dev/null >> %s 2>&1 &"
+              % (shlex.quote(fleet.python), shlex.quote(agent),
+                 " ".join(shlex.quote(f) for f in flags), LOG_NAME))
+    return """
+d={d}
+cd "$d" 2>/dev/null || {{ echo 'not deployed (run tx start without --no-deploy)'; exit 1; }}
+if [ -f {pid} ] && kill -0 "$(cat {pid} 2>/dev/null)" 2>/dev/null; then
+    echo 'already running -- tx stop first'; exit 1
+fi
+{launch}
+agent_pid=$!
+echo "$agent_pid" > {pid}
+sleep 0.3
+if kill -0 "$agent_pid" 2>/dev/null; then
+    echo armed
+elif [ -f {report} ]; then
+    # Gone already, but it left a record: a job short enough to finish
+    # inside this check has run, not crashed. Reading the absence of a
+    # process as a failure would fail every fast job.
+    echo 'ran already'
+else
+    echo 'the agent died on startup:'
+    tail -n 5 {log} 2>/dev/null
+    rm -f {pid}
+    exit 1
+fi
+""".format(d=shlex.quote(fleet.dir), pid=PID_NAME, launch=launch,
+           log=LOG_NAME, report=REPORT_NAME)
+
+
+def _kill_block(rdir):
+    """Shell that stops the agent and leaves $status set. Falls through in
+    every case -- `clean` appends the removal to it, so it must never
+    exit early.
+
+    The pid file is the primary handle. Killing the agent's whole process
+    group is what actually stops the job: the agent is a python process
+    whose child is a shell whose children are the benchmark, and killing
+    only the first of those leaves the machine still working.
+    """
+    return """
+d={d}
+status=not-deployed
+if [ -d "$d" ]; then
+    status=not-running
+    pid=""
+    [ -f "$d/{pid}" ] && pid=$(cat "$d/{pid}" 2>/dev/null)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+        status=stopped
+    elif {pgrep} >/dev/null 2>&1; then
+        {term} 2>/dev/null
+        status=stopped
+    fi
+    if [ "$status" = stopped ]; then
+        i=0
+        while [ $i -lt 20 ]; do
+            {pgrep} >/dev/null 2>&1 || break
+            sleep 0.5
+            i=$((i+1))
+        done
+        if {pgrep} >/dev/null 2>&1; then
+            {kill9} 2>/dev/null
+            status=killed
+        fi
+    fi
+    rm -f "$d/{pid}"
+fi
+""".format(d=shlex.quote(rdir), pid=PID_NAME, pgrep=PGREP,
+           term=PKILL % "TERM", kill9=PKILL % "KILL")
+
+
+def _run_id():
+    return time.strftime("%Y%m%d-%H%M%S")
+
+
+def cmd_start(args):
+    plan = load_plan(args.plan)
+    fleet = Fleet(plan, args)
+
+    if not args.no_deploy:
+        tarball = None
+        try:
+            if plan.payload:
+                tarball = _pack_payload(plan.payload)
+                log("[tx] payload %s -> %s packed"
+                    % (plan.payload, fmt_bytes(os.path.getsize(tarball))))
+            script = _deploy_script(fleet.dir, bool(plan.payload))
+
+            def deploy(host):
+                rc, out = fleet.sh(host, "mkdir -p %s"
+                                   % shlex.quote(fleet.dir))
+                if rc != 0:
+                    return rc, "mkdir failed: %s" % out
+                rc, out = fleet.push(host, [_agent_source()])
+                if rc != 0:
+                    return rc, "copy failed: %s" % out
+                if tarball:
+                    # scp lands a file under its own basename, and the
+                    # deploy script unpacks one fixed name.
+                    rc, out = fleet.push(host, [tarball], "payload.tar.gz")
+                    if rc != 0:
+                        return rc, "payload copy failed: %s" % out
+                return fleet.sh(host, script)
+
+            if fleet.each(deploy, "deploying the job", quiet=True):
+                return 1
+        finally:
+            if tarball:
+                os.unlink(tarball)
+
+    if not args.no_skew_check and not fleet.dry_run:
+        rc = _report_skew(fleet, args)
+        if rc:
+            return rc
+
+    delay = arm_delay(len(plan.hosts), args.start_in)
+    at = time.time() + delay
+    run_id = _run_id()
+    log("[tx] arming %d hosts for a start %s from now (%s)"
+        % (len(plan.hosts), fmt_secs(delay),
+           time.strftime("%H:%M:%S", time.localtime(at))))
+
+    index = dict((h, i) for i, h in enumerate(plan.hosts))
+
+    def start(host):
+        return fleet.sh(host, _start_script(fleet, plan, args, host, at,
+                                            index[host], run_id))
+
+    failed = fleet.each(start, "arming agents", quiet=True)
+    if failed:
+        log("[tx] some hosts were not armed; the run would not be "
+            "simultaneous, so it was not started on the rest either")
+        fleet.each(lambda h: fleet.sh(h, _kill_block(fleet.dir)
+                                      + 'echo "$status"\n'),
+                   "standing the armed hosts back down", quiet=True)
+        return 1
+
+    late = time.time() - at
+    if late > 0:
+        log("[tx] WARNING: arming took %s longer than the %s window, so the "
+            "last hosts started late. Raise --start-in."
+            % (fmt_secs(late), fmt_secs(delay)))
+    log("[tx] running: %d hosts, %s, timeout %s"
+        % (len(plan.hosts), plan.run, fmt_secs(plan.timeout)))
+    log("[tx] next: tx status      # who is running, who has finished")
+    log("[tx]       tx collect     # bring the results back")
+    log("[tx]       tx clean       # when you are done")
+    return 0
+
+
+def _report_skew(fleet, args):
+    """Check the fleet's clocks, and refuse a start they cannot support."""
+    skews = measure_skew(fleet)
+    unreadable = [h for h in fleet.plan.hosts if skews[h][0] is None]
+    if unreadable:
+        for host in unreadable:
+            log("[tx] %s: %s" % (host, skews[host][2]))
+        log("[tx] a clock that cannot be read cannot be trusted to start a "
+            "job at an agreed instant")
+        return 1
+    worst = max(abs(skews[h][0]) for h in fleet.plan.hosts)
+    spread = (max(skews[h][0] for h in fleet.plan.hosts)
+              - min(skews[h][0] for h in fleet.plan.hosts))
+    if worst > args.max_skew:
+        log("[tx] clocks disagree by up to %s (spread %s across the fleet), "
+            "over the --max-skew of %s:"
+            % (fmt_secs(worst), fmt_secs(spread), fmt_secs(args.max_skew)))
+        for host in sorted(fleet.plan.hosts,
+                           key=lambda h: -abs(skews[h][0]))[:8]:
+            log("    %-16s %+.3fs" % (host, skews[host][0]))
+        log("[tx] a synchronised start means nothing on a fleet whose clocks "
+            "do not agree. Fix ntp/chrony (binnacle's `skew` diagnoses it), "
+            "or pass --max-skew to accept it.")
+        return 1
+    log("[tx] clocks agree to within %s (spread %s)"
+        % (fmt_secs(worst), fmt_secs(spread)))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
+
+STATUS_SCRIPT_TMPL = """
+d={d}
+[ -d "$d" ] || {{ echo NOT-DEPLOYED; exit 0; }}
+cd "$d"
+alive=no
+if [ -f {pid} ] && kill -0 "$(cat {pid} 2>/dev/null)" 2>/dev/null; then
+    alive=yes
+fi
+if [ -f {report} ]; then
+    echo "ALIVE=$alive"
+    cat {report}
+else
+    [ "$alive" = yes ] && echo NOT-STARTED-YET || echo NOT-RUNNING
+fi
+"""
+
+
+def _status_script(rdir):
+    return STATUS_SCRIPT_TMPL.format(d=shlex.quote(rdir), pid=PID_NAME,
+                                     report=REPORT_NAME)
+
+
+def _parse_status(text):
+    """(alive, report-or-None, plain-word-or-None) out of one host's reply."""
+    text = (text or "").strip()
+    if not text:
+        return False, None, "NO-ANSWER"
+    if not text.startswith("ALIVE="):
+        return False, None, text.splitlines()[0].strip()
+    head, _, rest = text.partition("\n")
+    alive = head.strip() == "ALIVE=yes"
+    try:
+        return alive, json.loads(rest), None
+    except ValueError:
+        return alive, None, "UNREADABLE-REPORT"
+
+
+def _state_line(alive, report, word):
+    if word:
+        return word
+    state = report.get("state", "?")
+    if state == "done" or state == "timeout":
+        bits = "exit %s in %s" % (report.get("exit"),
+                                  fmt_secs(report.get("duration")))
+        if report.get("timed_out"):
+            return "TIMEOUT   %s" % bits
+        if report.get("exit") == 0:
+            return "DONE      %s" % bits
+        return "FAILED    %s" % bits
+    if state == "setup-failed":
+        return "SETUP-FAILED  exit %s" % report.get("setup_exit")
+    if not alive:
+        return "GONE      the agent is not running and left no result"
+    if state == "running":
+        began = report.get("started_at")
+        if began:
+            return "RUNNING   %s so far" % fmt_secs(time.time() - began)
+        return "RUNNING"
+    if state == "armed":
+        waiting = report.get("armed_for", 0) - time.time()
+        if waiting > 0:
+            return "ARMED     starts in %s" % fmt_secs(waiting)
+        return "ARMED"
+    return state.upper()
+
+
+def _collect_status(fleet):
+    script = _status_script(fleet.dir)
+    results = fleet.gather(lambda h: fleet.sh(h, script, timeout=30))
+    out = {}
+    for host in fleet.plan.hosts:
+        rc, text = results[host]
+        if rc != 0:
+            out[host] = (False, None, "UNREACHABLE")
+            continue
+        out[host] = _parse_status(text)
+    return out
+
+
+def _is_finished(entry):
+    alive, report, word = entry
+    if word in ("NOT-DEPLOYED", "NOT-RUNNING"):
+        return True
+    if report is None:
+        return False
+    if report.get("state") in ("done", "timeout", "setup-failed"):
+        return True
+    # No result and no agent: nothing more is coming from this host.
+    return not alive
+
+
+def cmd_status(args):
+    plan = load_plan(args.plan)
+    fleet = Fleet(plan, args)
+    while True:
+        if args.watch:
+            sys.stdout.write("\033[2J\033[H")
+            log("tx status -- %s (every %gs, ctrl-c to stop)"
+                % (time.strftime("%H:%M:%S"), args.watch))
+        states = _collect_status(fleet)
+        width = max(len(h) for h in plan.hosts)
+        for host in plan.hosts:
+            log("  %-*s  %s" % (width, host, _state_line(*states[host])))
+        if not args.watch:
+            break
+        try:
+            time.sleep(args.watch)
+        except KeyboardInterrupt:
+            break
+    return 0
+
+
+def _wait_for_fleet(fleet, deadline, quiet=False):
+    """Poll until every host has finished, or the deadline passes."""
+    last = None
+    while True:
+        states = _collect_status(fleet)
+        done = sum(1 for h in fleet.plan.hosts if _is_finished(states[h]))
+        if not quiet and done != last:
+            log("[tx] %d/%d hosts finished" % (done, len(fleet.plan.hosts)))
+            last = done
+        if done == len(fleet.plan.hosts):
+            return states, True
+        if time.time() > deadline:
+            return states, False
+        time.sleep(2.0)
+
+
+# ---------------------------------------------------------------------------
+# Collect
+# ---------------------------------------------------------------------------
+
+def default_dir(base=None):
+    """A directory of this collection's own, stamped with the time.
+
+    Collecting the same job twice an hour apart is the normal way to use
+    this, and the second run quietly replacing the first is not a result
+    anybody wants to find later. Two collections inside one second get
+    -2, -3 rather than sharing.
+    """
+    if base:
+        return base
+    stamp = time.strftime("tx-%Y%m%d-%H%M%S")
+    if not os.path.exists(stamp):
+        return stamp
+    for n in range(2, 100):
+        cand = "%s-%d" % (stamp, n)
+        if not os.path.exists(cand):
+            return cand
+    return "%s-%d" % (stamp, os.getpid())
+
+
+def _collect_script(rdir, patterns):
+    """A tar of everything worth bringing back, on stdout.
+
+    One round trip per host, whole files, framed by tar itself. The file
+    list is built on the far side because that is the only side that
+    knows what the job produced.
+    """
+    extra = " ".join(shlex.quote(p) for p in patterns)
+    return """
+d={d}
+cd "$d" 2>/dev/null || {{ echo 'tx: not deployed' >&2; exit 1; }}
+# Globbing is off while the patterns are still words, so an unmatched
+# one stays literal and is skipped by the -e test below. The `:` closes
+# the subshell with a success: every test in there is allowed to find
+# nothing, and letting the last one decide the subshell's status once
+# threw a whole host's collection away because one --collect glob
+# matched no files.
+set -f
+list=$(
+    for f in {always}; do [ -e "$f" ] && printf '%s\\n' "$f"; done
+    [ -d {out} ] && find {out} -type f -print
+    set +f
+    for pat in {extra}; do
+        for f in $pat; do [ -e "$f" ] && printf '%s\\n' "$f"; done
+    done
+    :
+)
+set +f
+[ -n "$list" ] || {{ echo 'tx: nothing to collect' >&2; exit 3; }}
+printf '%s\\n' "$list" | sort -u | tar cf - -T - 2>/dev/null
+""".format(d=shlex.quote(rdir), always=" ".join(ALWAYS), out=OUT_NAME,
+           extra=extra or "''")
+
+
+def _clean_relpath(name):
+    """A remote name reduced to a safe relative path.
+
+    Nothing a host says is used as a local path. `..` segments, absolute
+    paths and leading slashes are stripped here, so a host answering with
+    `../../etc/cron.d/x` writes inside the collection directory or not at
+    all.
+    """
+    parts = []
+    for part in name.replace("\\", "/").split("/"):
+        if not part or part == "." or part == "..":
+            continue
+        parts.append(part)
+    return "/".join(parts)
+
+
+def local_name(tag, host, relpath):
+    """Where one collected file lands: one directory, the name says which.
+
+    The tag leads, then the host, then the path it had on that host with
+    its separators folded in. That is the order that makes a shared
+    directory readable -- `ls` groups by run, `rm bench~*` clears one of
+    them -- and it is why the collection is a flat directory rather than
+    forty rebuilt trees.
+    """
+    rel = _clean_relpath(relpath) or "unnamed"
+    return FLAT_SEP.join([clean_tag(tag), host, rel.replace("/", FLAT_SEP)])
+
+
+def _extract(blob, dest, tag, host, taken):
+    """Unpack one host's tar into the collection directory, flattened."""
+    written, total, clashes = [], 0, []
+    tf = tarfile.open(fileobj=io.BytesIO(blob), mode="r|")
+    try:
+        for member in tf:
+            if not member.isfile():
+                continue
+            name = local_name(tag, host, member.name)
+            path = os.path.join(dest, name)
+            if name in taken:
+                clashes.append(member.name)
+                continue
+            taken.add(name)
+            src = tf.extractfile(member)
+            if src is None:
+                continue
+            with open(path, "wb") as fh:
+                shutil.copyfileobj(src, fh)
+            # Keep the execute bit and nothing else: a collected result is
+            # data, and a remote uid/gid means nothing here.
+            if member.mode & stat.S_IXUSR:
+                os.chmod(path, 0o755)
+            written.append((name, member.size))
+            total += member.size
+    finally:
+        tf.close()
+    return written, total, clashes
+
+
+class Collected(object):
+    __slots__ = ("host", "files", "bytes", "error", "clashes")
+
+    def __init__(self, host):
+        self.host = host
+        self.files = []
+        self.bytes = 0
+        self.error = ""
+        self.clashes = []
+
+
+def cmd_collect(args):
+    plan = load_plan(args.plan)
+    fleet = Fleet(plan, args)
+    dest = default_dir(args.dir)
+    if fleet.dry_run:
+        log("# %d host(s): %s" % (len(plan.hosts), " ".join(plan.hosts[:8])))
+        sys.stdout.write(_collect_script(fleet.dir, plan.collect))
+        return 0
+    try:
+        os.makedirs(dest)
+    except OSError as exc:
+        if exc.errno != errno.EEXIST:
+            die("cannot create %s: %s" % (dest, exc))
+
+    script = _collect_script(fleet.dir, plan.collect)
+    # Names are claimed under a lock-free protocol only because each host
+    # owns a disjoint slice of the namespace (the host name is in every
+    # name); the set is filled in plan order below, off the threads.
+    blobs = fleet.gather(lambda h: fleet.stream(h, script,
+                                                timeout=args.timeout))
+
+    taken = set()
+    results = []
+    for host in plan.hosts:
+        r = Collected(host)
+        rc, blob, err = blobs[host]
+        if rc == 3:
+            r.error = "nothing to collect (did the job run?)"
+        elif rc != 0 or not blob:
+            r.error = err or "collection failed (exit %s)" % rc
+        else:
+            try:
+                r.files, r.bytes, r.clashes = _extract(blob, dest, plan.tag,
+                                                       host, taken)
+            except tarfile.TarError as exc:
+                r.error = "unreadable stream: %s" % exc
+        results.append(r)
+
+    return _render_collection(results, dest, args)
+
+
+def _render_collection(results, dest, args):
+    good = [r for r in results if r.files and not r.error]
+    bad = [r for r in results if r.error]
+    empty = [r for r in results if not r.files and not r.error]
+    nfiles = sum(len(r.files) for r in results)
+    nbytes = sum(r.bytes for r in results)
+
+    log("")
+    log("tx collect -- %d file%s from %d of %d hosts, %s -> %s/"
+        % (nfiles, "" if nfiles == 1 else "s", len(good), len(results),
+           fmt_bytes(nbytes), dest))
+    log("")
+    for r in bad:
+        log("  FAILED    %s: %s" % (r.host, r.error))
+    for r in empty:
+        log("  EMPTY     %s: the job produced nothing" % r.host)
+    clashed = [r for r in results if r.clashes]
+    for r in clashed:
+        log("  COLLISION %s: %d file(s) folded onto a name already taken: %s"
+            % (r.host, len(r.clashes), " ".join(r.clashes[:3])))
+    if bad or empty or clashed:
+        log("")
+
+    if not args.quiet:
+        shown = [n for r in good for n, _s in r.files]
+        for name in shown[:12]:
+            log("  %s/%s" % (dest, name))
+        if len(shown) > 12:
+            log("  ... and %d more" % (len(shown) - 12))
+
+    if args.csv:
+        _write_csv(results, dest, args.csv)
+        log("[tx] %s" % args.csv)
+
+    # Exit 1 on an empty collection is deliberate: a script that fans out
+    # to gather results and gathers none should stop, not carry on with
+    # an empty directory.
+    return 1 if (bad or clashed or not nfiles) else 0
+
+
+CSV_FIELDS = ["host", "local_path", "bytes"]
+
+
+def _write_csv(results, dest, path):
+    import csv as _csv
+    fh = sys.stdout if path == "-" else open(path, "w", newline="")
+    try:
+        w = _csv.DictWriter(fh, fieldnames=CSV_FIELDS, lineterminator="\n")
+        w.writeheader()
+        for r in results:
+            if not r.files:
+                w.writerow({"host": r.host, "local_path": "", "bytes": 0})
+                continue
+            for name, size in r.files:
+                w.writerow({"host": r.host,
+                            "local_path": os.path.join(dest, name),
+                            "bytes": size})
+    finally:
+        if fh is not sys.stdout:
+            fh.close()
+
+
+# ---------------------------------------------------------------------------
+# Summarize
+# ---------------------------------------------------------------------------
+
+def _median(values):
+    if not values:
+        return None
+    s = sorted(values)
+    mid = len(s) // 2
+    if len(s) % 2:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) / 2.0
+
+
+def cmd_summarize(args):
+    plan = load_plan(args.plan)
+    fleet = Fleet(plan, args)
+    states = _collect_status(fleet)
+
+    reports, missing = [], []
+    for host in plan.hosts:
+        _alive, report, word = states[host]
+        if report is None:
+            missing.append((host, word or "no result"))
+        else:
+            reports.append(report)
+
+    passed = [r for r in reports if r.get("exit") == 0
+              and not r.get("timed_out")]
+    failed = [r for r in reports if r.get("exit") not in (0, None)
+              and not r.get("timed_out")]
+    timed = [r for r in reports if r.get("timed_out")]
+    setup_bad = [r for r in reports if r.get("state") == "setup-failed"]
+    unfinished = [r for r in reports
+                  if r.get("state") in ("running", "armed", "setup")]
+
+    log("")
+    log("tx -- %s   [%s]" % (plan.run, plan.tag))
+    log("      %d of %d hosts finished: %d passed, %d failed, %d timed out"
+        % (len(passed) + len(failed) + len(timed), len(plan.hosts),
+           len(passed), len(failed), len(timed)))
+    log("")
+
+    # The synchronisation is a measurement, so report it as one. Without
+    # this the claim "they all started together" is untestable.
+    offsets = [r["start_offset"] for r in reports
+               if r.get("start_offset") is not None]
+    if offsets:
+        spread = max(offsets) - min(offsets)
+        log("  START     spread %s across %d hosts (worst %+.3fs off the "
+            "armed instant)" % (fmt_secs(spread), len(offsets),
+                                max(offsets, key=abs)))
+        if spread > 1.0:
+            log("            that is wide enough to matter; raise "
+                "--start-in, or check the fleet's clocks")
+
+    durations = [r["duration"] for r in reports if r.get("duration")]
+    if durations:
+        med = _median(durations)
+        log("  DURATION  median %s, fastest %s, slowest %s"
+            % (fmt_secs(med), fmt_secs(min(durations)),
+               fmt_secs(max(durations))))
+        # An outlier here is the usual reason a fleet benchmark is being
+        # run at all, so name the hosts rather than only the number.
+        slow = sorted([r for r in reports if r.get("duration")],
+                      key=lambda r: -r["duration"])
+        if med and slow and slow[0]["duration"] > 1.5 * med:
+            out = [r for r in slow if r["duration"] > 1.5 * med][:args.top]
+            log("  SLOW      %d host(s) took over 1.5x the median:"
+                % len(out))
+            for r in out:
+                log("            %-16s %s" % (r["host"],
+                                              fmt_secs(r["duration"])))
+
+    if setup_bad:
+        log("  SETUP     %d host(s) never ran the job, setup failed:"
+            % len(setup_bad))
+        for r in setup_bad[:args.top]:
+            log("            %-16s exit %s" % (r["host"],
+                                               r.get("setup_exit")))
+        log("            tx collect brings back setup.log from each.")
+    if failed:
+        log("  FAILED    %d host(s) exited non-zero:" % len(failed))
+        for r in failed[:args.top]:
+            log("            %-16s exit %s after %s"
+                % (r["host"], r.get("exit"), fmt_secs(r.get("duration"))))
+        if len(failed) > args.top:
+            log("            ... and %d more" % (len(failed) - args.top))
+    if timed:
+        log("  TIMEOUT   %d host(s) hit the %s limit: %s"
+            % (len(timed), fmt_secs(plan.timeout),
+               " ".join(r["host"] for r in timed[:8])))
+        log("            raise timeout= in %s, or find out why they are "
+            "slower." % plan.path)
+    if unfinished:
+        log("  RUNNING   %d host(s) are still going: %s"
+            % (len(unfinished),
+               " ".join(r["host"] for r in unfinished[:8])))
+    if missing:
+        log("  NO RESULT %d host(s) said nothing:" % len(missing))
+        for host, why in missing[:args.top]:
+            log("            %-16s %s" % (host, why))
+
+    teardown_bad = [r for r in reports
+                    if r.get("teardown_exit") not in (0, None)]
+    if teardown_bad:
+        log("  TEARDOWN  %d host(s) failed to clean up after themselves: %s"
+            % (len(teardown_bad),
+               " ".join(r["host"] for r in teardown_bad[:8])))
+        log("            those hosts may not be as you found them.")
+
+    log("")
+    if not (failed or timed or missing or setup_bad or unfinished):
+        log("[tx] every host ran the job and exited zero.")
+    log("[tx] next: tx collect     # the results themselves")
+    log("[tx]       tx clean       # remove every trace")
+    return 0 if not (failed or timed or missing or setup_bad) else 1
+
+
+# ---------------------------------------------------------------------------
+# Stop, logs, clean
+# ---------------------------------------------------------------------------
+
+def cmd_stop(args):
+    plan = load_plan(args.plan)
+    fleet = Fleet(plan, args)
+    script = _kill_block(fleet.dir) + 'echo "$status"\n'
+    failed = fleet.each(lambda h: fleet.sh(h, script), "stopping the job")
+    log("[tx] whatever the job produced is still on the hosts:")
+    log("[tx]   tx collect     # bring it back")
+    log("[tx]   tx clean       # delete every trace")
+    return 1 if failed else 0
+
+
+def cmd_logs(args):
+    plan = load_plan(args.plan)
+    fleet = Fleet(plan, args)
+    dest = default_dir(args.dir)
+    try:
+        os.makedirs(dest)
+    except OSError as exc:
+        if exc.errno != errno.EEXIST:
+            die("cannot create %s: %s" % (dest, exc))
+
+    def one(host):
+        name = local_name(plan.tag, host, LOG_NAME)
+        rc, out = fleet.pull(host, LOG_NAME, os.path.join(dest, name))
+        if rc != 0:
+            return rc, "no agent log: %s" % out
+        return 0, "-> %s/%s" % (dest, name)
+
+    failed = fleet.each(one, "collecting agent logs into %s/" % dest)
+    return 1 if failed else 0
+
+
+def cmd_clean(args):
+    plan = load_plan(args.plan)
+    fleet = Fleet(plan, args)
+    if not args.yes and not args.dry_run:
+        log("[tx] this stops the job and deletes %s on %d hosts."
+            % (fleet.dir, len(plan.hosts)))
+        log("[tx] collect anything you want first (tx collect, tx logs).")
+        try:
+            reply = input("[tx] type 'yes' to continue: ")
+        except EOFError:
+            reply = ""
+        if reply.strip().lower() != "yes":
+            log("[tx] nothing done")
+            return 1
+    script = _kill_block(fleet.dir) + """
+rm -rf "$d"
+if [ -e "$d" ]; then echo "LEFTOVER: $d still exists"; exit 1; fi
+if {pgrep} >/dev/null 2>&1; then echo 'LEFTOVER: an agent is still running'; exit 1; fi
+echo "clean (was: $status)"
+""".format(pgrep=PGREP)
+    failed = fleet.each(lambda h: fleet.sh(h, script), "removing every trace")
+    if failed:
+        return 1
+    log("[tx] nothing of tx remains on the fleet -- no packages, no services, "
+        "no leftover payload (there never were any)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# run: the whole thing
+# ---------------------------------------------------------------------------
+
+def cmd_run(args):
+    plan = load_plan(args.plan)
+    rc = cmd_start(args)
+    if rc:
+        return rc
+    fleet = Fleet(plan, args)
+    # The fleet cannot take longer than its own timeout plus the arming
+    # window, so waiting past that means something is wrong rather than
+    # slow -- and an unbounded wait is how a script hangs forever.
+    deadline = time.time() + plan.timeout + arm_delay(
+        len(plan.hosts), args.start_in) + 60
+    log("[tx] waiting for the fleet (up to %s)"
+        % fmt_secs(deadline - time.time()))
+    _states, finished = _wait_for_fleet(fleet, deadline)
+    if not finished:
+        log("[tx] some hosts had not finished when the wait ran out; "
+            "collecting what there is")
+    summary = cmd_summarize(args)
+    collected = cmd_collect(args)
+    if args.clean:
+        args.yes = True
+        cmd_clean(args)
+    return 1 if (summary or collected or not finished) else 0
+
+
+# ---------------------------------------------------------------------------
+# gen, check, doctor
+# ---------------------------------------------------------------------------
+
+def cmd_gen(args):
+    tokens = read_server_list(args.servers)
+    seen = set()
+    for tok in tokens:
+        name, addr = parse_token(tok)
+        if name is None:
+            die("%s: cannot read host token %r" % (args.servers, tok))
+        if name in seen:
+            die("%s: %r is listed twice; a host's results would land on top "
+                "of each other" % (args.servers, name))
+        seen.add(name)
+
+    if not args.run:
+        die("--run is what every host will execute; there is no default")
+    if args.payload and not os.path.exists(args.payload):
+        die("--payload %s does not exist" % args.payload)
+    if args.timeout <= 0:
+        die("--timeout must be positive, got %g" % args.timeout)
+
+    tag = clean_tag(args.tag) if args.tag else default_tag(args.run)
+    write_plan(args.plan, tokens, args.run, args.setup or "",
+               args.teardown or "", args.payload or "", args.timeout,
+               args.collect or [], tag, args.remote_dir)
+    if args.plan == "-":
+        return 0
+    log("[tx] %s: %d hosts, tag %r" % (args.plan, len(tokens), tag))
+    log("[tx]   run: %s" % args.run)
+    if args.payload:
+        log("[tx]   payload: %s" % args.payload)
+    log("[tx] next: tx doctor      # is the fleet ready?")
+    log("[tx]       tx start       # deploy and run it everywhere")
+    return 0
+
+
+def cmd_check(args):
+    """Everything that can be checked without touching the fleet."""
+    plan = load_plan(args.plan)
+    log("[tx] plan   %s: %d hosts, tag %r" % (plan.path, len(plan.hosts),
+                                              plan.tag))
+    log("[tx] run    %s" % plan.run)
+    if plan.setup:
+        log("[tx] setup  %s" % plan.setup)
+    if plan.teardown:
+        log("[tx] teardn %s" % plan.teardown)
+    log("[tx] limit  %s per host" % fmt_secs(plan.timeout))
+
+    problems = 0
+    if plan.payload:
+        if not os.path.exists(plan.payload):
+            log("[tx] payload MISSING: %s" % plan.payload)
+            problems += 1
+        else:
+            total, count = 0, 0
+            if os.path.isdir(plan.payload):
+                for root, _dirs, files in os.walk(plan.payload):
+                    for f in files:
+                        try:
+                            total += os.path.getsize(os.path.join(root, f))
+                            count += 1
+                        except OSError:
+                            pass
+            else:
+                total, count = os.path.getsize(plan.payload), 1
+            log("[tx] payload %s: %d file(s), %s -- %s over the fleet"
+                % (plan.payload, count, fmt_bytes(total),
+                   fmt_bytes(total * len(plan.hosts))))
+            if total > 256 << 20:
+                log("[tx] that is a large payload to send to every host; "
+                    "consider staging it once and fetching it in setup=")
+    else:
+        log("[tx] payload none -- the job must already be on the hosts")
+
+    # A command that names a file the payload does not carry is the most
+    # common way a fleet run fails on all forty hosts at once, so say so
+    # here rather than after the deploy.
+    first = plan.run.strip().split()[0] if plan.run.strip() else ""
+    if first.startswith("./") and plan.payload:
+        want = first[2:]
+        have = (os.path.isdir(plan.payload)
+                and os.path.exists(os.path.join(plan.payload, want)))
+        if not have:
+            log("[tx] run starts with %r, which is not in the payload -- the "
+                "job would fail on every host" % first)
+            problems += 1
+    log("[tx] collect out/ and the run record, plus: %s"
+        % (" ".join(plan.collect) if plan.collect else "(nothing extra)"))
+    if problems:
+        log("[tx] %d problem(s) above would break the run" % problems)
+        return 1
+    log("[tx] the plan looks runnable: tx doctor, then tx start")
+    return 0
+
+
+def cmd_doctor(args):
+    plan = load_plan(args.plan)
+    fleet = Fleet(plan, args)
+    log("[tx] local checks")
+    log("  python      %d.%d.%d" % sys.version_info[:3])
+    for tool in ("ssh", "scp"):
+        found = any(os.access(os.path.join(p, tool), os.X_OK)
+                    for p in os.environ.get("PATH", "").split(os.pathsep) if p)
+        log("  %-11s %s" % (tool, "found" if found else "MISSING"))
+    log("  plan        %s: %d hosts, timeout %s"
+        % (plan.path, len(plan.hosts), fmt_secs(plan.timeout)))
+
+    script = """
+py=$({py} -V 2>&1 || echo 'MISSING python3')
+bash=$(bash --version 2>/dev/null | head -1 || echo 'MISSING bash')
+running=no
+{pgrep} >/dev/null 2>&1 && running=yes
+free=$(df -Pk {d} 2>/dev/null | awk 'NR==2{{print $4}}')
+[ -z "$free" ] && free=$(df -Pk / 2>/dev/null | awk 'NR==2{{print $4}}')
+echo "$py; cores=$(nproc 2>/dev/null || echo ?); free=${{free:-?}}KB; tar=$(command -v tar >/dev/null && echo yes || echo NO); agent_running=$running"
+""".format(py=shlex.quote(fleet.python), pgrep=PGREP,
+           d=shlex.quote(os.path.dirname(fleet.dir) or "/"))
+    log("")
+    failed = fleet.each(lambda h: fleet.sh(h, script, timeout=30),
+                        "checking hosts (ssh + python + bash + tar + disk)")
+    if failed:
+        log("[tx] fix ssh/python on those hosts first: key-based ssh must "
+            "work non-interactively (ssh-copy-id) and `%s` must exist."
+            % fleet.python)
+        return 1
+
+    log("")
+    log("[tx] checking the clocks, which is what a synchronised start "
+        "depends on")
+    if _report_skew(fleet, args):
+        return 1
+    log("[tx] fleet looks ready: tx start")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# hints
+# ---------------------------------------------------------------------------
+
+HINTS = [
+    ("run a benchmark on every host at once",
+     "tx gen --servers servers.txt --payload ./bench --run ./bench.sh",
+     "tx run",
+     "gen writes plan.ini; run deploys, starts everywhere at one instant, "
+     "waits, summarizes and collects."),
+    ("ship a benchmark that has to be built first",
+     "tx gen --servers servers.txt --payload ./src --setup 'make -s' "
+     "--run ./bench",
+     "tx run",
+     "setup= runs on each host before the job, and a host whose setup "
+     "fails does not run the job -- it says so instead of reporting a "
+     "failure that was never the benchmark's."),
+    ("get the results into one directory, named by host",
+     "tx collect",
+     "tx collect -d before-the-change",
+     "everything under out/ plus each host's stdout, stderr and run "
+     "record, named tag~host~path. -d names the directory; without it "
+     "each collection gets one of its own, stamped with the time."),
+    ("run the same job again and keep both sets",
+     "tx gen ... --tag before && tx run",
+     "tx gen ... --tag after && tx run -d results",
+     "the tag leads every filename, so two runs can share one directory "
+     "and still be told apart -- and `rm before~*` clears one of them."),
+    ("check the fleet before committing to a long run",
+     "tx check",
+     "tx doctor",
+     "check reads the plan and needs no ssh; doctor asks every host about "
+     "python, bash, tar, disk and its clock."),
+    ("find out why one host failed",
+     "tx status",
+     "tx collect && grep -l . *~stderr",
+     "status gives exit codes without moving any files; the collection "
+     "carries each host's stdout and stderr back under its own name."),
+    ("stop a run that is going wrong",
+     "tx stop",
+     "tx clean",
+     "stop kills the job and leaves what it produced; clean removes the "
+     "working directory and everything in it."),
+    ("run something on hosts where nothing is installed",
+     "tx gen --servers servers.txt --run 'uname -a; free -m'",
+     "tx run",
+     "no payload is needed when the job is only what is already there. "
+     "Python 3.6, bash and tar on each host is the whole requirement."),
+    ("give the job its own idea of the fleet",
+     "tx gen ... --run './shard.sh $TX_INDEX $TX_NHOSTS' --peers",
+     "tx run",
+     "every job gets TX_HOST, TX_INDEX, TX_NHOSTS, TX_OUT and TX_TAG; "
+     "--peers adds TX_HOSTS, the whole list, for a job that shards work "
+     "across the fleet."),
+    ("prove the runs really were simultaneous",
+     "tx summarize",
+     "",
+     "every agent records the instant it actually began; summarize "
+     "reports the spread across the fleet. If it is wide, --start-in was "
+     "too short or the clocks disagree."),
+]
+
+
+def cmd_hints(args):
+    log("tx hints -- what you want, and the command that gets it")
+    log("")
+    for goal, first, second, why in HINTS:
+        log("  %s" % goal)
+        log("      %s" % first)
+        if second:
+            log("      %s" % second)
+        for line in _wrap("      ", why):
+            log(line)
+        log("")
+    log("  every switch of every command:  tx help")
+    return 0
+
+
+def _wrap(prefix, text, width=76):
+    import textwrap
+    return textwrap.wrap(text, width=width, initial_indent=prefix,
+                         subsequent_indent=prefix) or [prefix + text]
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _add_fleet_flags(p):
+    p.add_argument("--plan", default=_env("TX_PLAN", DEFAULT_PLAN),
+                   help="plan file (default: %(default)s)")
+    p.add_argument("--user", default=_env("TX_USER", _env("SSH_USER", "")),
+                   help="ssh user (default: your ssh config)")
+    p.add_argument("--jobs", type=int,
+                   default=int(_env("TX_JOBS", str(DEFAULT_JOBS))),
+                   help="ssh fan-out concurrency (default: %(default)s)")
+    p.add_argument("--remote-dir", default=_env("TX_REMOTE_DIR", ""),
+                   help="working directory on each host (default: the "
+                        "plan's remote_dir)")
+    p.add_argument("--python", default=_env("TX_PYTHON", "python3"),
+                   help="python on the hosts (default: %(default)s)")
+    p.add_argument("--ssh", default=_env("TX_SSH", "ssh"),
+                   help=argparse.SUPPRESS)
+    p.add_argument("--scp", default=_env("TX_SCP", "scp"),
+                   help=argparse.SUPPRESS)
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the ssh/scp commands instead of running them")
+
+
+def _add_start_flags(p):
+    p.add_argument("--start-in", type=float, default=DEFAULT_START_IN,
+                   metavar="S",
+                   help="seconds to arm the synchronised start ahead of now; "
+                        "it has to outlast the ssh fan-out (default: "
+                        "%(default)s, and it grows with the fleet)")
+    p.add_argument("--max-skew", type=float, default=DEFAULT_MAX_SKEW,
+                   metavar="S",
+                   help="refuse to start if any host's clock is further than "
+                        "this from ours (default: %(default)s)")
+    p.add_argument("--no-skew-check", action="store_true",
+                   help="start without asking the fleet what time it is")
+    p.add_argument("--no-deploy", action="store_true",
+                   help="do not copy the agent or the payload, just start "
+                        "what is already there")
+    p.add_argument("--peers", action="store_true",
+                   help="put the whole host list in $TX_HOSTS for the job")
+
+
+def _add_collect_flags(p):
+    p.add_argument("-d", "--dir", default=_env("TX_DIR", ""), metavar="DIR",
+                   help="where collected files land (default: a "
+                        "tx-<timestamp> of this collection's own)")
+    p.add_argument("--timeout", type=float, default=900.0, metavar="S",
+                   help="per-host limit on the transfer (default: "
+                        "%(default)s)")
+    p.add_argument("--csv", metavar="PATH", nargs="?", const="-",
+                   help="also write one row per collected file")
+    p.add_argument("--quiet", action="store_true",
+                   help="no file listing, just the findings")
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="tx", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version",
+                    version="tx %s\n"
+                            "Copyright (C) 2026 Martin J. Gallagher\n"
+                            "License: GPL-3.0-or-later "
+                            "<https://www.gnu.org/licenses/gpl-3.0.html>\n"
+                            "This is free software: you are free to change "
+                            "and redistribute it.\n"
+                            "There is no warranty, to the extent permitted "
+                            "by law." % VERSION)
+    sub = ap.add_subparsers(dest="cmd")
+
+    g = sub.add_parser("gen", help="build plan.ini from a server list")
+    g.add_argument("--servers", default=_env("TX_SERVERS", DEFAULT_SERVERS),
+                   help="one host per line: name[=addr] (default: "
+                        "%(default)s)")
+    g.add_argument("--plan", default=_env("TX_PLAN", DEFAULT_PLAN),
+                   help="where to write it, or - for stdout (default: "
+                        "%(default)s)")
+    g.add_argument("--run", metavar="CMD",
+                   help="the command every host runs, under bash")
+    g.add_argument("--setup", metavar="CMD",
+                   help="run on each host before the job")
+    g.add_argument("--teardown", metavar="CMD",
+                   help="run on each host after the job, pass or fail")
+    g.add_argument("--payload", metavar="PATH",
+                   help="a file or directory shipped to every host and "
+                        "unpacked into the working directory")
+    g.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
+                   metavar="S",
+                   help="seconds before a host's job is killed (default: "
+                        "%(default)s)")
+    g.add_argument("--collect", action="append", metavar="GLOB",
+                   help="extra things to collect, repeatable; out/ and the "
+                        "run record always come back")
+    g.add_argument("--tag", metavar="NAME",
+                   help="leads every collected filename (default: the "
+                        "command's first word)")
+    g.add_argument("--remote-dir", default=_env("TX_REMOTE_DIR",
+                                                DEFAULT_REMOTE_DIR),
+                   help="working directory on each host (default: "
+                        "%(default)s)")
+
+    c = sub.add_parser("check", help="will this plan work? no ssh")
+    c.add_argument("--plan", default=_env("TX_PLAN", DEFAULT_PLAN),
+                   help="plan file (default: %(default)s)")
+
+    d = sub.add_parser("doctor", help="is the fleet ready?")
+    _add_fleet_flags(d)
+    d.add_argument("--max-skew", type=float, default=DEFAULT_MAX_SKEW,
+                   metavar="S", help="clock tolerance (default: %(default)s)")
+
+    s = sub.add_parser("start", help="deploy and start everywhere at once")
+    _add_fleet_flags(s)
+    _add_start_flags(s)
+
+    st = sub.add_parser("status", help="one line per host")
+    _add_fleet_flags(st)
+    st.add_argument("--watch", type=float, nargs="?", const=2.0, metavar="S",
+                    help="repeat every S seconds (default: 2)")
+
+    co = sub.add_parser("collect", help="bring the results back")
+    _add_fleet_flags(co)
+    _add_collect_flags(co)
+
+    su = sub.add_parser("summarize", help="who passed, who was slow")
+    _add_fleet_flags(su)
+    su.add_argument("--top", type=int, default=10, metavar="N",
+                    help="hosts to name in each finding (default: "
+                         "%(default)s)")
+
+    sp = sub.add_parser("stop", help="stop the job, keep what it made")
+    _add_fleet_flags(sp)
+
+    lg = sub.add_parser("logs", help="collect the agents' own logs")
+    _add_fleet_flags(lg)
+    lg.add_argument("-d", "--dir", default="", metavar="DIR",
+                    help="where they land (default: a tx-<timestamp>)")
+
+    cl = sub.add_parser("clean", help="stop, then delete every trace")
+    _add_fleet_flags(cl)
+    cl.add_argument("--yes", action="store_true",
+                    help="do not ask for confirmation")
+
+    r = sub.add_parser("run", help="start, wait, summarize and collect")
+    _add_fleet_flags(r)
+    _add_start_flags(r)
+    _add_collect_flags(r)
+    r.add_argument("--top", type=int, default=10, metavar="N",
+                   help=argparse.SUPPRESS)
+    r.add_argument("--clean", action="store_true",
+                   help="also remove every trace once the results are back")
+
+    sub.add_parser("hints", help="a goal, and the command that gets it")
+    sub.add_parser("help", help="every switch of every command, one page")
+
+    a = sub.add_parser("agent", help=argparse.SUPPRESS)
+    a.add_argument("--host", required=True)
+    a.add_argument("--at", type=float, required=True,
+                   help="unix time to begin at")
+    a.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    a.add_argument("--tag", default="tx")
+    a.add_argument("--run-id", dest="run_id", default="")
+    a.add_argument("--index", type=int, default=0)
+    a.add_argument("--nhosts", type=int, default=1)
+    a.add_argument("--run", required=True, help="base64 of the command")
+    a.add_argument("--setup", default="")
+    a.add_argument("--teardown", default="")
+    a.add_argument("--peers", default="")
+    return ap
+
+
+def cmd_full_help(ap):
+    """`tx help`: the complete flag reference, generated from the real
+    parsers so it cannot drift from what the code accepts."""
+    sub_action = next(a for a in ap._actions
+                      if isinstance(a, argparse._SubParsersAction))
+    log("tx %s -- every command, every switch. `tx CMD --help` shows one"
+        % VERSION)
+    log("command with its defaults; `tx hints` maps goals to commands.")
+    for name, parser in sub_action.choices.items():
+        if name == "help":
+            continue
+        log("")
+        log("=" * 74)
+        for line in parser.format_help().rstrip().splitlines():
+            if line.strip() == "options:":
+                continue
+            log(line)
+    log("")
+    log("=" * 74)
+    log("the job's environment on each host:")
+    log("  TX_HOST   this host's name in the plan")
+    log("  TX_OUT    where results should be written (collected in full)")
+    log("  TX_TAG    the run's tag, which leads every collected filename")
+    log("  TX_RUN_ID the run's stamp, shared by every host in one start")
+    log("  TX_INDEX / TX_NHOSTS   this host's position in the fleet")
+    log("  TX_HOSTS  the whole host list, with --peers")
+    log("")
+    log("environment variables (each is the default for the matching flag):")
+    log("  TX_PLAN TX_SERVERS TX_REMOTE_DIR TX_DIR TX_USER (or SSH_USER)")
+    log("  TX_JOBS TX_PYTHON")
+    return 0
+
+
+COMMANDS = {
+    "gen": cmd_gen, "check": cmd_check, "doctor": cmd_doctor,
+    "start": cmd_start, "status": cmd_status, "collect": cmd_collect,
+    "summarize": cmd_summarize, "stop": cmd_stop, "logs": cmd_logs,
+    "clean": cmd_clean, "run": cmd_run, "hints": cmd_hints,
+    "agent": cmd_agent,
+}
+
+
+def main(argv=None):
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if not args.cmd:
+        ap.print_help()
+        log("")
+        log("start here:  tx gen --servers servers.txt --payload ./bench "
+            "--run ./bench.sh && tx run")
+        log("stuck?       tx hints        every switch:  tx help")
+        return 2
+    if args.cmd == "help":
+        return cmd_full_help(ap)
+    try:
+        return COMMANDS[args.cmd](args) or 0
+    except KeyboardInterrupt:
+        log("")
+        log("[tx] interrupted")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

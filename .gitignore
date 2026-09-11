@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+docs/_build/
+.tox/
+# Bundles are handover artifacts, not committed files.
+bundle.txt
+bundle.part*of*.txt
+# A run's own leavings, if anybody drives the fleet from a checkout.
+plan.ini
+tx-20*/
+
+# Generated from the live parsers on every docs build.
+docs/cli.md
