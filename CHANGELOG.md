@@ -9,6 +9,53 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`tx run --batch N` covers a fleet bigger than what can run at once.**
+  Some jobs cannot go fleet-wide in one go -- a licence with a seat
+  count, a filer with only so much throughput, a power envelope, a test
+  fixture that takes twenty machines. The answer is not to give up the
+  simultaneity but to narrow what it applies to: each wave of N hosts is
+  armed for its own instant and is as simultaneous as any whole-fleet
+  run, and the waves march through the fleet in plan order until it is
+  used up.
+
+  Everything lands in **one** directory, chosen before the first wave,
+  because the point of covering the fleet is to end with one set of
+  results for all of it -- the names already carry the host, so a
+  hundred hosts' results sit together and still read apart.
+
+  A wave is an ordinary run over a smaller plan, so start, collect and
+  clean are the same code a whole-fleet run uses rather than a second
+  path that only waves take.
+
+  The report says what fraction of the fleet was reached, and is
+  rendered from what each wave recorded while its hosts still held the
+  record -- by the end the early waves have been collected and possibly
+  cleaned, and polling then would read them as hosts that never
+  answered. Hosts a stopped sweep never got to are reported as
+  `NOT REACHED`, not counted as passes.
+
+  By default a wave that fails does not stop the sweep: one unreachable
+  rack should not cost the other nine their coverage. `--stop-on-fail`
+  stops instead.
+
+### Fixed
+
+- **The start spread no longer claims waves were simultaneous with each
+  other.** Each host's offset is measured against its *own* wave's
+  instant, so in `--batch` mode the figure is how tightly each wave
+  began -- reporting it as "spread across N hosts" read as a claim about
+  the whole fleet that `--batch` deliberately does not make. It now says
+  "within each wave", and names the trade.
+
+- **`SLOW` no longer fires on scheduler noise.** The finding was a bare
+  ratio against the median, so a 9ms job against a 6ms median was
+  reported as an outlier. Below a one-second median the ratio is not
+  measuring the job, and the finding is withheld.
+
 ## [1.0.0] - 2026-09-11
 
 First release. `tx` runs one benchmark or test on a whole fleet at once

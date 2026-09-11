@@ -376,6 +376,20 @@ def write_plan(path, tokens, run, setup, teardown, payload, timeout,
             out.close()
 
 
+def slice_plan(plan, hosts):
+    """The same job, over some of the fleet.
+
+    Coverage mode is built out of this: a wave is an ordinary run over a
+    smaller plan, so every command it uses -- start, collect, clean --
+    is the one already tested against a whole fleet, not a second code
+    path that only waves take.
+    """
+    return Plan(plan.path, list(hosts),
+                dict((h, plan.addrs[h]) for h in hosts),
+                plan.run, plan.setup, plan.teardown, plan.payload,
+                plan.timeout, plan.collect, plan.tag, plan.remote_dir)
+
+
 def read_server_list(path):
     if not os.path.isfile(path):
         die("server list not found: %s" % path)
@@ -916,8 +930,8 @@ def _run_id():
     return time.strftime("%Y%m%d-%H%M%S")
 
 
-def cmd_start(args):
-    plan = load_plan(args.plan)
+def cmd_start(args, plan=None):
+    plan = plan or load_plan(args.plan)
     fleet = Fleet(plan, args)
 
     if not args.no_deploy:
@@ -1280,8 +1294,8 @@ class Collected(object):
         self.clashes = []
 
 
-def cmd_collect(args):
-    plan = load_plan(args.plan)
+def cmd_collect(args, plan=None):
+    plan = plan or load_plan(args.plan)
     fleet = Fleet(plan, args)
     dest = default_dir(args.dir)
     if fleet.dry_run:
@@ -1397,11 +1411,21 @@ def _median(values):
     return (s[mid - 1] + s[mid]) / 2.0
 
 
-def cmd_summarize(args):
-    plan = load_plan(args.plan)
+def cmd_summarize(args, plan=None):
+    plan = plan or load_plan(args.plan)
     fleet = Fleet(plan, args)
-    states = _collect_status(fleet)
+    return render_summary(plan, _collect_status(fleet), args)
 
+
+def render_summary(plan, states, args, waves=0):
+    """The report, from states already gathered.
+
+    Kept separate from the polling because coverage mode cannot poll at
+    the end: by then the earlier waves have been collected and possibly
+    cleaned, and a host that was wiped an hour ago would read as one that
+    never answered. So a wave records what it saw while it could, and
+    this renders the lot.
+    """
     reports, missing = [], []
     for host in plan.hosts:
         _alive, report, word = states[host]
@@ -1424,6 +1448,13 @@ def cmd_summarize(args):
     log("      %d of %d hosts finished: %d passed, %d failed, %d timed out"
         % (len(passed) + len(failed) + len(timed), len(plan.hosts),
            len(passed), len(failed), len(timed)))
+    if waves:
+        # The whole point of coverage mode is the denominator, so say what
+        # fraction of the fleet was actually reached.
+        reached = len(reports)
+        log("      covered %d of %d hosts in %d wave%s of at most %d"
+            % (reached, len(plan.hosts), waves, "" if waves == 1 else "s",
+               args.batch))
     log("")
 
     # The synchronisation is a measurement, so report it as one. Without
@@ -1432,9 +1463,16 @@ def cmd_summarize(args):
                if r.get("start_offset") is not None]
     if offsets:
         spread = max(offsets) - min(offsets)
-        log("  START     spread %s across %d hosts (worst %+.3fs off the "
-            "armed instant)" % (fmt_secs(spread), len(offsets),
-                                max(offsets, key=abs)))
+        # Each offset is measured against that host's *own* armed instant,
+        # and in wave mode every wave has its own. So this is how tightly
+        # each wave began, not a claim that the whole fleet started
+        # together -- which in wave mode it deliberately did not.
+        where = "within each wave" if waves else "across %d hosts" % len(offsets)
+        log("  START     spread %s %s (worst %+.3fs off the armed instant)"
+            % (fmt_secs(spread), where, max(offsets, key=abs)))
+        if waves:
+            log("            waves are simultaneous in themselves, not with "
+                "each other -- that is what --batch trades away")
         if spread > 1.0:
             log("            that is wide enough to matter; raise "
                 "--start-in, or check the fleet's clocks")
@@ -1449,7 +1487,10 @@ def cmd_summarize(args):
         # run at all, so name the hosts rather than only the number.
         slow = sorted([r for r in reports if r.get("duration")],
                       key=lambda r: -r["duration"])
-        if med and slow and slow[0]["duration"] > 1.5 * med:
+        # A ratio on its own calls a 9ms job "slow" against a 6ms median,
+        # which is scheduler noise wearing a finding's clothes. Below a
+        # second, the ratio is not measuring the job.
+        if med >= 1.0 and slow and slow[0]["duration"] > 1.5 * med:
             out = [r for r in slow if r["duration"] > 1.5 * med][:args.top]
             log("  SLOW      %d host(s) took over 1.5x the median:"
                 % len(out))
@@ -1497,8 +1538,9 @@ def cmd_summarize(args):
     log("")
     if not (failed or timed or missing or setup_bad or unfinished):
         log("[tx] every host ran the job and exited zero.")
-    log("[tx] next: tx collect     # the results themselves")
-    log("[tx]       tx clean       # remove every trace")
+    if not waves:
+        log("[tx] next: tx collect     # the results themselves")
+        log("[tx]       tx clean       # remove every trace")
     return 0 if not (failed or timed or missing or setup_bad) else 1
 
 
@@ -1506,8 +1548,8 @@ def cmd_summarize(args):
 # Stop, logs, clean
 # ---------------------------------------------------------------------------
 
-def cmd_stop(args):
-    plan = load_plan(args.plan)
+def cmd_stop(args, plan=None):
+    plan = plan or load_plan(args.plan)
     fleet = Fleet(plan, args)
     script = _kill_block(fleet.dir) + 'echo "$status"\n'
     failed = fleet.each(lambda h: fleet.sh(h, script), "stopping the job")
@@ -1538,8 +1580,8 @@ def cmd_logs(args):
     return 1 if failed else 0
 
 
-def cmd_clean(args):
-    plan = load_plan(args.plan)
+def cmd_clean(args, plan=None):
+    plan = plan or load_plan(args.plan)
     fleet = Fleet(plan, args)
     if not args.yes and not args.dry_run:
         log("[tx] this stops the job and deletes %s on %d hosts."
@@ -1570,29 +1612,127 @@ echo "clean (was: $status)"
 # run: the whole thing
 # ---------------------------------------------------------------------------
 
+def _wait_deadline(args, plan):
+    """When to stop waiting for a set of hosts.
+
+    A fleet cannot take longer than its own timeout plus the arming
+    window, so waiting past that means something is wrong rather than
+    slow -- and an unbounded wait is how a script hangs forever.
+    """
+    return (time.time() + plan.timeout
+            + arm_delay(len(plan.hosts), args.start_in) + 60)
+
+
 def cmd_run(args):
     plan = load_plan(args.plan)
-    rc = cmd_start(args)
+    if args.batch is not None:
+        return run_in_waves(args, plan)
+
+    rc = cmd_start(args, plan)
     if rc:
         return rc
     fleet = Fleet(plan, args)
-    # The fleet cannot take longer than its own timeout plus the arming
-    # window, so waiting past that means something is wrong rather than
-    # slow -- and an unbounded wait is how a script hangs forever.
-    deadline = time.time() + plan.timeout + arm_delay(
-        len(plan.hosts), args.start_in) + 60
+    deadline = _wait_deadline(args, plan)
     log("[tx] waiting for the fleet (up to %s)"
         % fmt_secs(deadline - time.time()))
     _states, finished = _wait_for_fleet(fleet, deadline)
     if not finished:
         log("[tx] some hosts had not finished when the wait ran out; "
             "collecting what there is")
-    summary = cmd_summarize(args)
-    collected = cmd_collect(args)
+    summary = cmd_summarize(args, plan)
+    collected = cmd_collect(args, plan)
     if args.clean:
         args.yes = True
-        cmd_clean(args)
+        cmd_clean(args, plan)
     return 1 if (summary or collected or not finished) else 0
+
+
+# ---------------------------------------------------------------------------
+# Coverage: the whole fleet, a few hosts at a time
+# ---------------------------------------------------------------------------
+
+def waves_of(hosts, size):
+    """The fleet cut into waves of at most `size`, in plan order.
+
+    Plan order rather than anything cleverer: two sweeps of the same
+    fleet then cover it the same way, which is what makes a second run
+    comparable to the first.
+    """
+    return [hosts[i:i + size] for i in range(0, len(hosts), size)]
+
+
+def run_in_waves(args, plan):
+    """Cover the whole fleet a few hosts at a time.
+
+    Some jobs cannot run fleet-wide at once -- a licence with a seat
+    count, a filer that only has so much throughput, a power envelope,
+    a test fixture that handles twenty machines. The answer is not to
+    give up the simultaneity but to narrow what it applies to: each wave
+    is armed for its own instant and is as simultaneous as any whole-fleet
+    run, and the waves march through the fleet until it is used up.
+
+    Everything lands in **one** directory, because the point of covering
+    the fleet is to end with one set of results for all of it. The names
+    already carry the host, so a hundred hosts' results sit together and
+    still read apart.
+    """
+    waves = waves_of(plan.hosts, args.batch)
+    # Chosen once, before the first wave: the default is stamped with the
+    # time, and a fresh directory per wave would scatter one sweep's
+    # results across ten of them.
+    args.dir = default_dir(args.dir)
+    log("[tx] coverage: %d hosts in %d wave%s of at most %d -> %s/"
+        % (len(plan.hosts), len(waves), "" if len(waves) == 1 else "s",
+           args.batch, args.dir))
+
+    states = {}
+    trouble = []
+    for n, hosts in enumerate(waves, 1):
+        log("")
+        log("[tx] === wave %d of %d: %s ==="
+            % (n, len(waves), " ".join(hosts[:8])
+               + (" ..." if len(hosts) > 8 else "")))
+        sub = slice_plan(plan, hosts)
+        if cmd_start(args, sub):
+            # cmd_start has already stood this wave back down. The fleet
+            # beyond it is untouched, so unless told otherwise carry on:
+            # one unreachable rack should not cost the other nine.
+            trouble.append(n)
+            for host in hosts:
+                states[host] = (False, None, "WAVE DID NOT START")
+            if args.stop_on_fail:
+                log("[tx] --stop-on-fail: not starting the remaining waves")
+                break
+            continue
+
+        deadline = _wait_deadline(args, sub)
+        wave_states, finished = _wait_for_fleet(Fleet(sub, args), deadline)
+        # Recorded now, while the record is still on the hosts: the
+        # collection below, and a --clean after it, are about to take it
+        # away, and the final report is rendered from what we saw here.
+        states.update(wave_states)
+        if not finished:
+            log("[tx] wave %d had hosts still running when the wait ran "
+                "out; collecting what there is" % n)
+            trouble.append(n)
+
+        if cmd_collect(args, sub):
+            trouble.append(n)
+        if args.clean:
+            args.yes = True
+            cmd_clean(args, sub)
+        if args.stop_on_fail and not finished:
+            log("[tx] --stop-on-fail: not starting the remaining waves")
+            break
+
+    # A sweep stopped early leaves hosts nobody ever asked. Saying so is
+    # the difference between "they passed" and "they were never run".
+    for host in plan.hosts:
+        states.setdefault(host, (False, None, "NOT REACHED"))
+
+    rc = render_summary(plan, states, args, waves=len(waves))
+    log("[tx] results: %s/" % args.dir)
+    return 1 if (rc or trouble) else 0
 
 
 # ---------------------------------------------------------------------------
@@ -1786,6 +1926,13 @@ HINTS = [
      "every job gets TX_HOST, TX_INDEX, TX_NHOSTS, TX_OUT and TX_TAG; "
      "--peers adds TX_HOSTS, the whole list, for a job that shards work "
      "across the fleet."),
+    ("run on a fleet bigger than what can run at once",
+     "tx run --batch 20 -d results",
+     "tx run --batch 20 --stop-on-fail",
+     "a licence seat count, a filer, a power envelope: --batch covers the "
+     "whole fleet a few hosts at a time, each wave armed for its own "
+     "instant, everything landing in one directory. It is not --jobs, "
+     "which is only how many ssh connections are open."),
     ("prove the runs really were simultaneous",
      "tx summarize",
      "",
@@ -1863,7 +2010,8 @@ def _add_start_flags(p):
 def _add_collect_flags(p):
     p.add_argument("-d", "--dir", default=_env("TX_DIR", ""), metavar="DIR",
                    help="where collected files land (default: a "
-                        "tx-<timestamp> of this collection's own)")
+                        "tx-<timestamp> of this collection's own; with "
+                        "--batch, one directory for the whole sweep)")
     p.add_argument("--timeout", type=float, default=900.0, metavar="S",
                    help="per-host limit on the transfer (default: "
                         "%(default)s)")
@@ -1968,6 +2116,16 @@ def build_parser():
                    help=argparse.SUPPRESS)
     r.add_argument("--clean", action="store_true",
                    help="also remove every trace once the results are back")
+    r.add_argument("-b", "--batch", type=int, default=None, metavar="N",
+                   help="cover the fleet N hosts at a time instead of all "
+                        "at once: each wave is armed for its own instant, "
+                        "waited for and collected, then the next wave "
+                        "starts, until the fleet is used up. Everything "
+                        "lands in one directory. This is not --jobs, which "
+                        "is only how many ssh connections are open at once")
+    r.add_argument("--stop-on-fail", action="store_true",
+                   help="with --batch, stop after a wave that did not start "
+                        "or did not finish, instead of carrying on")
 
     sub.add_parser("hints", help="a goal, and the command that gets it")
     sub.add_parser("help", help="every switch of every command, one page")
@@ -2042,6 +2200,16 @@ def main(argv=None):
         return 2
     if args.cmd == "help":
         return cmd_full_help(ap)
+    # A wave of nought hosts never ends and a wave of minus three is not a
+    # number of hosts, so neither is quietly read as "all of them".
+    if getattr(args, "batch", None) is not None and args.batch < 1:
+        die("--batch is how many hosts run at once, so it wants at least 1, "
+            "got %d (leave it out to run the whole fleet together)"
+            % args.batch)
+    if (getattr(args, "stop_on_fail", False)
+            and getattr(args, "batch", None) is None):
+        die("--stop-on-fail is about the waves --batch makes; without it "
+            "there is only one wave and nothing to stop")
     try:
         return COMMANDS[args.cmd](args) or 0
     except KeyboardInterrupt:
