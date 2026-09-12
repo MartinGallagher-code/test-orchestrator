@@ -113,7 +113,12 @@ TEARDOWN_LOG = "teardown.log"
 PID_NAME = "agent.pid"
 LOG_NAME = "agent.log"
 OUT_NAME = "out"
-ALWAYS = (REPORT_NAME, STDOUT_NAME, STDERR_NAME, SETUP_LOG, TEARDOWN_LOG)
+STDIN_DEFAULT = ""
+# The agent's own log is in here because a run that went wrong is exactly
+# when you need it: anything the agent could not turn into a record --
+# a job that would not launch at all -- lands there and nowhere else.
+ALWAYS = (REPORT_NAME, STDOUT_NAME, STDERR_NAME, SETUP_LOG, TEARDOWN_LOG,
+          LOG_NAME)
 
 # The separator between the parts of a collected file's name. `~` is legal
 # in a filename everywhere, needs no shell quoting, and does not occur in
@@ -185,15 +190,16 @@ def unb64(text):
 # it, so no command but `gen` needs those flags.
 
 PLAN_KEYS = ("run", "setup", "teardown", "payload", "timeout", "collect",
-             "tag", "remote_dir")
+             "tag", "remote_dir", "stdin")
 
 
 class Plan(object):
     __slots__ = ("path", "hosts", "addrs", "run", "setup", "teardown",
-                 "payload", "timeout", "collect", "tag", "remote_dir")
+                 "payload", "timeout", "collect", "tag", "remote_dir",
+                 "stdin")
 
     def __init__(self, path, hosts, addrs, run, setup, teardown, payload,
-                 timeout, collect, tag, remote_dir):
+                 timeout, collect, tag, remote_dir, stdin=""):
         self.path = path
         self.hosts = hosts
         self.addrs = addrs
@@ -205,6 +211,7 @@ class Plan(object):
         self.collect = collect
         self.tag = tag
         self.remote_dir = remote_dir
+        self.stdin = stdin
 
 
 def parse_token(tok):
@@ -310,7 +317,8 @@ def load_plan(path):
     return Plan(path, hosts, addrs, run, get("setup"), get("teardown"),
                 get("payload"), timeout, collect,
                 clean_tag(get("tag") or default_tag(run)),
-                get("remote_dir", DEFAULT_REMOTE_DIR))
+                get("remote_dir", DEFAULT_REMOTE_DIR),
+                get("stdin", STDIN_DEFAULT))
 
 
 def _ini_value(text):
@@ -326,7 +334,7 @@ def _ini_value(text):
 
 
 def write_plan(path, tokens, run, setup, teardown, payload, timeout,
-               collect, tag, remote_dir):
+               collect, tag, remote_dir, stdin=""):
     out = sys.stdout if path == "-" else open(path, "w")
     try:
         out.write("# tx plan v%s -- one job, run on every host at the same "
@@ -351,6 +359,10 @@ def write_plan(path, tokens, run, setup, teardown, payload, timeout,
                   "# directory: the benchmark itself, its data, whatever it "
                   "needs.\n")
         out.write("payload = %s\n" % payload)
+        out.write("\n# A file in the working directory to feed the job on "
+                  "stdin. Ship it in\n# the payload; without one the job "
+                  "reads /dev/null.\n")
+        out.write("stdin = %s\n" % stdin)
         out.write("\n# Seconds before a host's job is killed. Not optional: "
                   "a job with no\n# bound is a fleet nobody can get back.\n")
         out.write("timeout = %g\n" % timeout)
@@ -387,7 +399,8 @@ def slice_plan(plan, hosts):
     return Plan(plan.path, list(hosts),
                 dict((h, plan.addrs[h]) for h in hosts),
                 plan.run, plan.setup, plan.teardown, plan.payload,
-                plan.timeout, plan.collect, plan.tag, plan.remote_dir)
+                plan.timeout, plan.collect, plan.tag, plan.remote_dir,
+                plan.stdin)
 
 
 def read_server_list(path):
@@ -581,6 +594,54 @@ def _write_json(path, obj):
     os.replace(tmp, path)
 
 
+# How much of a job's stderr is carried back inside the record. Enough to
+# say what went wrong, not so much that a chatty job turns every host's
+# record into a log file -- the whole stderr is collected regardless.
+TAIL_BYTES = 2000
+TAIL_LINES = 5
+
+
+def _tail_text(path, nbytes=TAIL_BYTES, nlines=TAIL_LINES):
+    """The last few lines of a file, for putting in the record.
+
+    Read from the end rather than whole: a job that wrote a gigabyte of
+    warnings should not be loaded into memory to find out it failed on
+    the last line.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > nbytes:
+                fh.seek(size - nbytes)
+            blob = fh.read()
+    except (OSError, IOError):
+        return ""
+    text = blob.decode("utf-8", "replace")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return "\n".join(lines[-nlines:])
+
+
+def _open_stdin(name, workdir):
+    """What the job reads on stdin. Returns (file-or-DEVNULL, error).
+
+    A job given nothing reads /dev/null, which is what makes a command
+    that waits on input fail at once instead of hanging until the
+    timeout. A job given a file reads that -- it travels in the payload
+    like everything else the job needs, so the name is relative to the
+    working directory.
+    """
+    if not name:
+        return subprocess.DEVNULL, ""
+    path = os.path.join(workdir, name)
+    if not os.path.isfile(path):
+        return None, ("stdin file %r is not on this host -- ship it in the "
+                      "payload, or drop stdin= from the plan" % name)
+    try:
+        return open(path, "rb"), ""
+    except (OSError, IOError) as exc:
+        return None, "cannot read stdin file %r: %s" % (name, exc)
+
+
 def _run_phase(command, cwd, env, logpath, timeout):
     """Run one phase (setup/teardown) and record what it said.
 
@@ -696,6 +757,8 @@ def cmd_agent(args):
         "uname": " ".join(os.uname()),
         "setup_exit": None,
         "teardown_exit": None,
+        "stderr_tail": "",
+        "detail": "",
         "started_at": None,
         "finished_at": None,
         "duration": None,
@@ -739,13 +802,43 @@ def cmd_agent(args):
     # claimed, so it is recorded even when it is tiny.
     report["start_offset"] = started - args.at
 
+    # What the job reads. /dev/null unless the plan named a file, so a
+    # command that waits on input finds EOF rather than hanging until the
+    # timeout and reporting nothing.
+    fin, stdin_err = _open_stdin(args.stdin, workdir)
+    if stdin_err:
+        report["state"] = "launch-failed"
+        report["detail"] = stdin_err
+        _write_json(REPORT_NAME, report)
+        with open(STDERR_NAME, "ab") as fh:
+            fh.write(("tx agent: %s\n" % stdin_err).encode("utf-8"))
+        sys.stderr.write("tx agent: %s\n" % stdin_err)
+        return 1
+
     fout = open(STDOUT_NAME, "wb")
     ferr = open(STDERR_NAME, "wb")
     try:
-        p = subprocess.Popen(["bash", "-c", run_cmd], cwd=workdir, env=env,
-                             stdout=fout, stderr=ferr,
-                             stdin=subprocess.DEVNULL,
-                             start_new_session=True)
+        try:
+            p = subprocess.Popen(["bash", "-c", run_cmd], cwd=workdir,
+                                 env=env, stdout=fout, stderr=ferr,
+                                 stdin=fin, start_new_session=True)
+        except OSError as exc:
+            # The job never started -- no bash, a working directory that
+            # went away. Letting this escape left the record saying
+            # "running" for a host that was doing nothing at all, and put
+            # the only explanation in the agent's log where `tx collect`
+            # could not see it. It is a result, so it is recorded as one.
+            report["state"] = "launch-failed"
+            report["detail"] = str(exc)
+            report["finished_at"] = time.time()
+            report["duration"] = report["finished_at"] - started
+            _write_json(REPORT_NAME, report)
+            ferr.write(("tx agent: the job would not start: %s\n"
+                        % exc).encode("utf-8"))
+            ferr.flush()
+            report["stderr_tail"] = _tail_text(STDERR_NAME)
+            _write_json(REPORT_NAME, report)
+            return 1
         _RUNNING.append(p)
         try:
             p.communicate(timeout=args.timeout)
@@ -759,11 +852,18 @@ def cmd_agent(args):
     finally:
         fout.close()
         ferr.close()
+        if fin not in (None, subprocess.DEVNULL):
+            fin.close()
 
     report["finished_at"] = time.time()
     report["duration"] = report["finished_at"] - started
     report["exit"] = rc
     report["state"] = "timeout" if report["timed_out"] else "done"
+    # The last of the job's stderr, carried in the record so `tx status`
+    # and `tx summarize` can say *why* a host failed without anybody
+    # having to collect the run and go looking. The file still comes back
+    # whole; this is the part you read first.
+    report["stderr_tail"] = _tail_text(STDERR_NAME)
     _write_json(REPORT_NAME, report)
 
     # Teardown runs whether the job passed, failed or was killed: leaving
@@ -847,6 +947,8 @@ def _start_script(fleet, plan, args, host, at, index, run_id):
         flags += ["--setup", b64(plan.setup)]
     if plan.teardown:
         flags += ["--teardown", b64(plan.teardown)]
+    if plan.stdin:
+        flags += ["--stdin", plan.stdin]
     if args.peers:
         flags += ["--peers", b64(" ".join(plan.hosts))]
 
@@ -1089,6 +1191,9 @@ def _state_line(alive, report, word):
         return "FAILED    %s" % bits
     if state == "setup-failed":
         return "SETUP-FAILED  exit %s" % report.get("setup_exit")
+    if state == "launch-failed":
+        return "NEVER RAN  %s" % (report.get("detail") or "the job would "
+                                  "not start")
     if not alive:
         return "GONE      the agent is not running and left no result"
     if state == "running":
@@ -1123,7 +1228,8 @@ def _is_finished(entry):
         return True
     if report is None:
         return False
-    if report.get("state") in ("done", "timeout", "setup-failed"):
+    if report.get("state") in ("done", "timeout", "setup-failed",
+                               "launch-failed"):
         return True
     # No result and no agent: nothing more is coming from this host.
     return not alive
@@ -1440,6 +1546,7 @@ def render_summary(plan, states, args, waves=0):
               and not r.get("timed_out")]
     timed = [r for r in reports if r.get("timed_out")]
     setup_bad = [r for r in reports if r.get("state") == "setup-failed"]
+    never = [r for r in reports if r.get("state") == "launch-failed"]
     unfinished = [r for r in reports
                   if r.get("state") in ("running", "armed", "setup")]
 
@@ -1505,11 +1612,22 @@ def render_summary(plan, states, args, waves=0):
             log("            %-16s exit %s" % (r["host"],
                                                r.get("setup_exit")))
         log("            tx collect brings back setup.log from each.")
+    if never:
+        log("  NEVER RAN %d host(s) could not start the job at all:"
+            % len(never))
+        for r in never[:args.top]:
+            log("            %-16s %s" % (r["host"], r.get("detail") or "?"))
+        log("            nothing ran there, so there is no result to read "
+            "as a failure.")
     if failed:
         log("  FAILED    %d host(s) exited non-zero:" % len(failed))
         for r in failed[:args.top]:
             log("            %-16s exit %s after %s"
                 % (r["host"], r.get("exit"), fmt_secs(r.get("duration"))))
+            # What the job said on its way out, so the report answers
+            # "why" rather than only "which".
+            for line in (r.get("stderr_tail") or "").splitlines()[-2:]:
+                log("            %-16s   %s" % ("", line[:96]))
         if len(failed) > args.top:
             log("            ... and %d more" % (len(failed) - args.top))
     if timed:
@@ -1536,12 +1654,12 @@ def render_summary(plan, states, args, waves=0):
         log("            those hosts may not be as you found them.")
 
     log("")
-    if not (failed or timed or missing or setup_bad or unfinished):
+    if not (failed or timed or missing or setup_bad or unfinished or never):
         log("[tx] every host ran the job and exited zero.")
     if not waves:
         log("[tx] next: tx collect     # the results themselves")
         log("[tx]       tx clean       # remove every trace")
-    return 0 if not (failed or timed or missing or setup_bad) else 1
+    return 0 if not (failed or timed or missing or setup_bad or never) else 1
 
 
 # ---------------------------------------------------------------------------
@@ -1761,7 +1879,7 @@ def cmd_gen(args):
     tag = clean_tag(args.tag) if args.tag else default_tag(args.run)
     write_plan(args.plan, tokens, args.run, args.setup or "",
                args.teardown or "", args.payload or "", args.timeout,
-               args.collect or [], tag, args.remote_dir)
+               args.collect or [], tag, args.remote_dir, args.stdin or "")
     if args.plan == "-":
         return 0
     log("[tx] %s: %d hosts, tag %r" % (args.plan, len(tokens), tag))
@@ -1822,6 +1940,13 @@ def cmd_check(args):
         if not have:
             log("[tx] run starts with %r, which is not in the payload -- the "
                 "job would fail on every host" % first)
+            problems += 1
+    if plan.stdin:
+        log("[tx] stdin   %s, fed to the job" % plan.stdin)
+        if plan.payload and os.path.isdir(plan.payload) and not os.path.exists(
+                os.path.join(plan.payload, plan.stdin)):
+            log("[tx] stdin %r is not in the payload -- the job would find "
+                "nothing to read on every host" % plan.stdin)
             problems += 1
     log("[tx] collect out/ and the run record, plus: %s"
         % (" ".join(plan.collect) if plan.collect else "(nothing extra)"))
@@ -2056,6 +2181,9 @@ def build_parser():
                    metavar="S",
                    help="seconds before a host's job is killed (default: "
                         "%(default)s)")
+    g.add_argument("--stdin", metavar="NAME",
+                   help="a file in the working directory to feed the job on "
+                        "stdin; ship it in the payload")
     g.add_argument("--collect", action="append", metavar="GLOB",
                    help="extra things to collect, repeatable; out/ and the "
                         "run record always come back")
@@ -2142,6 +2270,7 @@ def build_parser():
     a.add_argument("--run", required=True, help="base64 of the command")
     a.add_argument("--setup", default="")
     a.add_argument("--teardown", default="")
+    a.add_argument("--stdin", default="")
     a.add_argument("--peers", default="")
     return ap
 
