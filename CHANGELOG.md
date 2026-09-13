@@ -13,6 +13,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`tx run --batch --resume` picks a sweep up from the fleet's own
+  record.** A ten-wave sweep can take hours and `tx run` has to stay
+  alive to sequence it; if it does not, nothing local is lost, because
+  nothing was kept locally. Resume asks the fleet where it got to and
+  reads three answers, not two: a host with a result is done, a host
+  still working is one the interrupted sweep left running -- agents are
+  detached, so the work outlived the orchestrator, and restarting it
+  would trample a run that is nearly finished -- and only what is
+  neither gets covered in fresh waves.
+
+  Hosts already done are collected again rather than assumed collected.
+  A host that finished the job and was killed before its results were
+  fetched has them on the host and nothing here, and skipping it because
+  it "has a result" is how a resumed sweep quietly loses the very hosts
+  it is meant to be recovering.
+
+- **`--poll S`, and a status poll that backs off on its own.** Every
+  check is an ssh per host, and those land on the machines whose
+  benchmark is being measured. The fixed two-second poll was sixty
+  thousand connections over a ten-minute run on two hundred hosts, to
+  learn nothing most of the time, while perturbing the thing under test.
+  The interval now grows with the wait -- two seconds at first, thirty
+  once it has been going five minutes -- so a quick job is still noticed
+  quickly and a long one is asked about twice a minute. `--poll` pins it.
+
 - **The job can be fed a file on stdin.** `stdin = NAME` in the plan
   (`tx gen --stdin NAME`) hands the job a file from the working
   directory, which ships in the payload like everything else it needs.

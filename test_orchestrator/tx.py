@@ -1222,6 +1222,36 @@ def _collect_status(fleet):
     return out
 
 
+def _has_result(entry):
+    """Has this host already run the job and recorded how it went?
+
+    Different from _is_finished, which also counts a host nothing is
+    coming from -- not deployed, no agent, no record. That is "stop
+    waiting"; this is "there is an answer here", which is what makes a
+    sweep resumable without the orchestrator remembering anything.
+    """
+    _alive, report, _word = entry
+    if report is None:
+        return False
+    return report.get("state") in ("done", "timeout", "setup-failed",
+                                   "launch-failed")
+
+
+def _still_working(entry):
+    """Is this host busy with a job right now?
+
+    The third answer resume needs. Agents are detached, so an
+    interrupted sweep leaves its last wave still running: those hosts
+    have no result yet, but starting them again would trample live work
+    and throw away the run that is already most of the way done. They
+    are waited for, not restarted.
+    """
+    alive, report, word = entry
+    if report is not None:
+        return report.get("state") in ("armed", "running", "setup")
+    return alive or word == "NOT-STARTED-YET"
+
+
 def _is_finished(entry):
     alive, report, word = entry
     if word in ("NOT-DEPLOYED", "NOT-RUNNING"):
@@ -1256,9 +1286,40 @@ def cmd_status(args):
     return 0
 
 
-def _wait_for_fleet(fleet, deadline, quiet=False):
-    """Poll until every host has finished, or the deadline passes."""
+POLL_FLOOR = 2.0
+POLL_CEILING = 30.0
+
+
+def poll_interval(waited, pinned=None):
+    """How long to wait before asking the fleet again.
+
+    Asking is not free and it is not neutral: every poll is an ssh
+    connection per host, and those land on the very machines whose
+    benchmark is being measured. A fixed two seconds costs sixty
+    thousand connections over a ten-minute run on two hundred hosts --
+    to learn nothing, most of them, while perturbing the thing under
+    test.
+
+    So the interval grows with how long we have already been waiting. A
+    job that finishes in seconds is still noticed in seconds; one that
+    has been running an hour is asked about twice a minute. Nobody needs
+    two-second resolution on a benchmark that takes ten minutes.
+    """
+    if pinned:
+        return pinned
+    return min(max(POLL_FLOOR, waited / 10.0), POLL_CEILING)
+
+
+def _wait_for_fleet(fleet, deadline, quiet=False, pinned=None):
+    """Poll until every host has finished, or the deadline passes.
+
+    Each poll is a fresh short ssh per host, closed as soon as it has
+    answered -- nothing is held between polls, and the agents do not
+    care whether anybody is watching. Killing this loop loses the
+    waiting, not the run.
+    """
     last = None
+    began = time.time()
     while True:
         states = _collect_status(fleet)
         done = sum(1 for h in fleet.plan.hosts if _is_finished(states[h]))
@@ -1269,7 +1330,7 @@ def _wait_for_fleet(fleet, deadline, quiet=False):
             return states, True
         if time.time() > deadline:
             return states, False
-        time.sleep(2.0)
+        time.sleep(poll_interval(time.time() - began, pinned))
 
 
 # ---------------------------------------------------------------------------
@@ -1753,7 +1814,7 @@ def cmd_run(args):
     deadline = _wait_deadline(args, plan)
     log("[tx] waiting for the fleet (up to %s)"
         % fmt_secs(deadline - time.time()))
-    _states, finished = _wait_for_fleet(fleet, deadline)
+    _states, finished = _wait_for_fleet(fleet, deadline, pinned=args.poll)
     if not finished:
         log("[tx] some hosts had not finished when the wait ran out; "
             "collecting what there is")
@@ -1794,29 +1855,89 @@ def run_in_waves(args, plan):
     already carry the host, so a hundred hosts' results sit together and
     still read apart.
     """
-    waves = waves_of(plan.hosts, args.batch)
+    states = {}
+    trouble = []
+    hosts = plan.hosts
     # Chosen once, before the first wave: the default is stamped with the
     # time, and a fresh directory per wave would scatter one sweep's
     # results across ten of them.
     args.dir = default_dir(args.dir)
-    log("[tx] coverage: %d hosts in %d wave%s of at most %d -> %s/"
-        % (len(plan.hosts), len(waves), "" if len(waves) == 1 else "s",
-           args.batch, args.dir))
 
-    states = {}
-    trouble = []
-    for n, hosts in enumerate(waves, 1):
+    if args.resume:
+        # No progress file, no state in this process: the answer is
+        # already on the hosts, in the same run.json every other command
+        # reads. One status sweep says where the fleet stands, and that
+        # is what makes a sweep survive its own orchestrator being
+        # killed.
+        #
+        # Three answers, not two. A host with a result is done. A host
+        # still working is one the interrupted sweep left running --
+        # agents are detached, so the work outlived the orchestrator --
+        # and restarting it would trample a run that is nearly finished.
+        # Only what is neither gets covered in waves.
+        log("[tx] --resume: asking the fleet where it got to")
+        seen = _collect_status(Fleet(plan, args))
+        already = [h for h in plan.hosts if _has_result(seen[h])]
+        busy = [h for h in plan.hosts
+                if h not in set(already) and _still_working(seen[h])]
+        hosts = [h for h in plan.hosts
+                 if h not in set(already) and h not in set(busy)]
+        log("[tx] %d done, %d still running, %d left to cover"
+            % (len(already), len(busy), len(hosts)))
+        states.update(dict((h, seen[h]) for h in already))
+
+        if already:
+            # Collect them again rather than assuming the interrupted
+            # sweep got that far. A host that finished the job and was
+            # killed before its results were fetched has a result *on
+            # the host* and nothing here -- skipping it because it "has
+            # a result" is how a resumed sweep quietly loses the very
+            # hosts it is meant to be recovering. Re-fetching a host
+            # that was already collected costs a transfer and rewrites
+            # identical files; losing one costs the run.
+            log("[tx] re-collecting the %d finished host(s), in case the "
+                "interrupted sweep never got their results back"
+                % len(already))
+            if cmd_collect(args, slice_plan(plan, already)):
+                trouble.append(0)
+
+        if busy:
+            log("[tx] waiting for the %d host(s) the interrupted sweep left "
+                "running rather than starting them over" % len(busy))
+            sub = slice_plan(plan, busy)
+            busy_states, finished = _wait_for_fleet(
+                Fleet(sub, args), _wait_deadline(args, sub),
+                pinned=args.poll)
+            states.update(busy_states)
+            if not finished:
+                trouble.append(0)
+            if cmd_collect(args, sub):
+                trouble.append(0)
+
+        if not hosts:
+            log("[tx] nothing left to cover.")
+            for host in plan.hosts:
+                states.setdefault(host, (False, None, "NOT REACHED"))
+            rc = render_summary(plan, states, args, waves=0)
+            log("[tx] results: %s/" % args.dir)
+            return 1 if (rc or trouble) else 0
+
+    waves = waves_of(hosts, args.batch)
+    log("[tx] coverage: %d host%s in %d wave%s of at most %d -> %s/"
+        % (len(hosts), "" if len(hosts) == 1 else "s", len(waves),
+           "" if len(waves) == 1 else "s", args.batch, args.dir))
+    for n, wave in enumerate(waves, 1):
         log("")
         log("[tx] === wave %d of %d: %s ==="
-            % (n, len(waves), " ".join(hosts[:8])
-               + (" ..." if len(hosts) > 8 else "")))
-        sub = slice_plan(plan, hosts)
+            % (n, len(waves), " ".join(wave[:8])
+               + (" ..." if len(wave) > 8 else "")))
+        sub = slice_plan(plan, wave)
         if cmd_start(args, sub):
             # cmd_start has already stood this wave back down. The fleet
             # beyond it is untouched, so unless told otherwise carry on:
             # one unreachable rack should not cost the other nine.
             trouble.append(n)
-            for host in hosts:
+            for host in wave:
                 states[host] = (False, None, "WAVE DID NOT START")
             if args.stop_on_fail:
                 log("[tx] --stop-on-fail: not starting the remaining waves")
@@ -1824,7 +1945,8 @@ def run_in_waves(args, plan):
             continue
 
         deadline = _wait_deadline(args, sub)
-        wave_states, finished = _wait_for_fleet(Fleet(sub, args), deadline)
+        wave_states, finished = _wait_for_fleet(Fleet(sub, args), deadline,
+                                                pinned=args.poll)
         # Recorded now, while the record is still on the hosts: the
         # collection below, and a --clean after it, are about to take it
         # away, and the final report is rendered from what we saw here.
@@ -2251,6 +2373,17 @@ def build_parser():
                         "starts, until the fleet is used up. Everything "
                         "lands in one directory. This is not --jobs, which "
                         "is only how many ssh connections are open at once")
+    r.add_argument("--resume", action="store_true",
+                   help="with --batch, skip hosts that already have a "
+                        "result and cover only what is left. The fleet "
+                        "itself is the record, so a sweep survives its "
+                        "own orchestrator being killed")
+    r.add_argument("--poll", type=float, default=None, metavar="S",
+                   help="seconds between status checks while waiting "
+                        "(default: from 2s, growing to 30s the longer the "
+                        "wait). Every check is an ssh per host, landing on "
+                        "the machines under measurement, so rarely is "
+                        "usually better")
     r.add_argument("--stop-on-fail", action="store_true",
                    help="with --batch, stop after a wave that did not start "
                         "or did not finish, instead of carrying on")
@@ -2335,6 +2468,13 @@ def main(argv=None):
         die("--batch is how many hosts run at once, so it wants at least 1, "
             "got %d (leave it out to run the whole fleet together)"
             % args.batch)
+    if getattr(args, "poll", None) is not None and args.poll <= 0:
+        die("--poll is how many seconds to wait between status checks, so "
+            "it wants a positive number, got %g (leave it out to let it "
+            "back off on its own)" % args.poll)
+    if getattr(args, "resume", False) and getattr(args, "batch", None) is None:
+        die("--resume picks up a --batch sweep where it stopped; without "
+            "--batch there are no waves to resume")
     if (getattr(args, "stop_on_fail", False)
             and getattr(args, "batch", None) is None):
         die("--stop-on-fail is about the waves --batch makes; without it "

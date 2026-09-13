@@ -192,6 +192,45 @@ rack should not cost the other nine their coverage. `--stop-on-fail`
 stops instead, and the hosts nobody got to are reported as `NOT REACHED`
 rather than quietly counted as passes.
 
+### A sweep survives its own orchestrator
+
+A ten-wave sweep can take hours, and `tx run` has to stay alive to
+sequence it. If it doesn't — you closed the laptop, the ssh session
+dropped, somebody hit ^C — `--resume` picks it up from the fleet's own
+record. Nothing is remembered here, so there is nothing to lose:
+
+```bash
+tx run --batch 20 -d results --resume
+```
+
+```text
+[tx] --resume: asking the fleet where it got to
+[tx] 120 done, 20 still running, 60 left to cover
+[tx] re-collecting the 120 finished host(s), in case the interrupted sweep never got their results back
+[tx] waiting for the 20 host(s) the interrupted sweep left running rather than starting them over
+```
+
+Three answers, not two. A host with a result is **done** — and is
+collected again anyway, because a host that finished the job and was
+killed before its results were fetched has them on the host and nothing
+here. A host still working is one the interrupted sweep left running:
+agents are detached, so the work outlived the orchestrator, and
+restarting it would trample a run that is nearly finished. Only what is
+neither gets covered in fresh waves.
+
+### How often it asks
+
+Every status check is an ssh per host, and those land on the machines
+whose benchmark you are measuring. A fixed two-second poll is sixty
+thousand connections over a ten-minute run on two hundred hosts — to
+learn nothing, most of them, while perturbing the thing under test.
+
+So the interval grows with how long the wait has already lasted: two
+seconds at first, thirty seconds once it has been going five minutes.
+A job that finishes quickly is still noticed quickly; one that takes an
+hour is asked about twice a minute. `--poll S` pins it if you want a
+fixed interval.
+
 ---
 
 ## Shipping the job
