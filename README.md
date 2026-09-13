@@ -86,7 +86,7 @@ agents to install, no packages, no root. Key-based SSH must already work
 |---|---|
 | `tx gen` | Build `plan.ini` from your server list. |
 | `tx start` | Copy the job to every host and arm them all for one instant. |
-| `tx status` | One line per host: `ARMED`, `RUNNING`, `DONE exit 0`, `TIMEOUT`. |
+| `tx status` | One line per host: `ARMED`, `RUNNING`, `TIDYING`, `DONE exit 0`, `TIMEOUT`. |
 | `tx collect` | Bring the results back into one directory, named by host. |
 | `tx summarize` | Who passed, who failed, who was slow — and how tight the start was. |
 | `tx clean` | Stop, then delete everything. No trace left. |
@@ -192,6 +192,45 @@ rack should not cost the other nine their coverage. `--stop-on-fail`
 stops instead, and the hosts nobody got to are reported as `NOT REACHED`
 rather than quietly counted as passes.
 
+### A sweep survives its own orchestrator
+
+A ten-wave sweep can take hours, and `tx run` has to stay alive to
+sequence it. If it doesn't — you closed the laptop, the ssh session
+dropped, somebody hit ^C — `--resume` picks it up from the fleet's own
+record. Nothing is remembered here, so there is nothing to lose:
+
+```bash
+tx run --batch 20 -d results --resume
+```
+
+```text
+[tx] --resume: asking the fleet where it got to
+[tx] 120 done, 20 still running, 60 left to cover
+[tx] re-collecting the 120 finished host(s), in case the interrupted sweep never got their results back
+[tx] waiting for the 20 host(s) the interrupted sweep left running rather than starting them over
+```
+
+Three answers, not two. A host with a result is **done** — and is
+collected again anyway, because a host that finished the job and was
+killed before its results were fetched has them on the host and nothing
+here. A host still working is one the interrupted sweep left running:
+agents are detached, so the work outlived the orchestrator, and
+restarting it would trample a run that is nearly finished. Only what is
+neither gets covered in fresh waves.
+
+### How often it asks
+
+Every status check is an ssh per host, and those land on the machines
+whose benchmark you are measuring. A fixed two-second poll is sixty
+thousand connections over a ten-minute run on two hundred hosts — to
+learn nothing, most of them, while perturbing the thing under test.
+
+So the interval grows with how long the wait has already lasted: two
+seconds at first, thirty seconds once it has been going five minutes.
+A job that finishes quickly is still noticed quickly; one that takes an
+hour is asked about twice a minute. `--poll S` pins it if you want a
+fixed interval.
+
 ---
 
 ## Shipping the job
@@ -222,6 +261,11 @@ it is a wrong answer rather than a missing one. The report says so, and
 **`--teardown` runs afterwards**, pass or fail, so a host is left as it
 was found. That is not conditional on the run going well — it is exactly
 when cleanup matters most.
+
+A host is not *finished* until it has been put back: while the teardown
+runs the host reads `TIDYING`, and `tx run` waits for that before
+collecting. Otherwise the collection would race a teardown still writing
+into `$TX_OUT` and leave its output behind.
 
 ### What the job reads, and what it says
 

@@ -188,6 +188,139 @@ t_a_wave_that_cannot_start_is_named_not_skipped_silently() {
     assert_contains "$RUN_OUT" "wave 2 of 2"
 }
 
+# ---- resume: the fleet is the record ----------------------------------------
+
+# Start a sweep in the background and return the ORCHESTRATOR's pid.
+#
+# The python process itself, not `tx` -- that is a shell function here, so
+# backgrounding it would give the pid of a subshell, and killing that
+# leaves the real orchestrator running to race whatever comes next. This
+# cost a while to find, so it is written down.
+sweep_in_background() {
+    python3 "$TX" "$@" > "$TEST_TMPDIR/sweep.log" 2>&1 &
+    echo $!
+}
+
+t_a_killed_sweep_is_resumed_from_the_fleets_own_record() {
+    # The point of --resume: nothing is remembered here, so there is
+    # nothing to lose when this process dies. The hosts hold the record.
+    install_fake_ssh
+    # Each wave takes a couple of seconds, so killing at 7s genuinely
+    # lands mid-sweep. With an instant job the whole thing finishes
+    # first and the test proves nothing.
+    plan="$(plan_for --run 'sleep 2; echo "$TX_HOST" > "$TX_OUT/who"' \
+            --tag sweep --timeout 40 -- a b c d e f)"
+    driver="$(sweep_in_background run --plan "$plan" --batch 2 --start-in 1 \
+              --no-skew-check -d results --quiet)"
+    sleep 7
+    # The orchestrator is orphaned by the command substitution that
+    # started it, so `wait` does not apply and kill -9 is asynchronous:
+    # give it a moment to actually go before claiming it has.
+    kill -9 "$driver" 2>/dev/null
+    i=0
+    while [ "$i" -lt 50 ]; do
+        kill -0 "$driver" 2>/dev/null || break
+        sleep 0.1
+        i=$((i + 1))
+    done
+    kill -0 "$driver" 2>/dev/null && fail "the orchestrator outlived the kill"
+    # The sweep really was interrupted: somebody is still missing.
+    covered="$(find results -name 'sweep~*~out~who' 2>/dev/null | wc -l | tr -d ' ')"
+    assert_between 1 5 "$covered" \
+        "the kill should land mid-sweep, but $covered of 6 were already done"
+
+    run_tx run --plan "$plan" --batch 2 --start-in 1 --no-skew-check \
+        -d results --resume --quiet
+    assert_status 0 "$RUN_RC"
+    assert_contains "$RUN_OUT" "asking the fleet where it got to"
+    for h in a b c d e f; do
+        assert_file_exists "results/sweep~$h~out~who" \
+            "$h was never covered by the resumed sweep"
+    done
+    assert_contains "$RUN_OUT" "re-collecting"
+}
+
+t_resume_waits_for_hosts_still_running_rather_than_restarting_them() {
+    # Agents are detached, so an interrupted sweep leaves its last wave
+    # still working. Starting those hosts again would trample a run that
+    # is nearly done -- and the deploy would refuse anyway.
+    install_fake_ssh
+    plan="$(plan_for --run 'sleep 6; echo "$TX_HOST" > "$TX_OUT/who"' \
+            --tag sweep --timeout 40 -- a b c d)"
+    driver="$(sweep_in_background run --plan "$plan" --batch 2 --start-in 1 \
+              --no-skew-check -d results --quiet)"
+    # Long enough for wave 1 to be well underway, not long enough to end.
+    sleep 4
+    kill -9 "$driver" 2>/dev/null
+    i=0
+    while [ "$i" -lt 50 ]; do
+        kill -0 "$driver" 2>/dev/null || break
+        sleep 0.1
+        i=$((i + 1))
+    done
+
+    run_tx run --plan "$plan" --batch 2 --start-in 1 --no-skew-check \
+        -d results --resume --quiet
+    assert_status 0 "$RUN_RC"
+    assert_contains "$RUN_OUT" "still running"
+    assert_contains "$RUN_OUT" "rather than starting them over"
+    assert_not_contains "$RUN_OUT" "already running here"
+    for h in a b c d; do
+        assert_file_exists "results/sweep~$h~out~who" "$h was lost"
+    done
+}
+
+t_resuming_a_finished_sweep_does_nothing() {
+    install_fake_ssh
+    plan="$(sweep_plan a b)"
+    run_tx run --plan "$plan" --batch 1 --start-in 1 --no-skew-check \
+        -d results --quiet
+    assert_status 0 "$RUN_RC"
+    run_tx run --plan "$plan" --batch 1 --start-in 1 --no-skew-check \
+        -d results2 --resume --quiet
+    assert_status 0 "$RUN_RC"
+    assert_contains "$RUN_OUT" "nothing left to cover"
+    assert_contains "$RUN_OUT" "2 done, 0 still running, 0 left"
+}
+
+t_resume_needs_waves_to_resume() {
+    install_fake_ssh
+    plan="$(sweep_plan a b)"
+    run_tx run --plan "$plan" --resume
+    assert_status 2 "$RUN_RC"
+    assert_contains "$RUN_OUT" "no waves to resume"
+}
+
+# ---- polling ----------------------------------------------------------------
+
+t_the_poll_backs_off_the_longer_it_waits() {
+    # Every poll is an ssh per host, landing on the machines under
+    # measurement. A fixed two seconds is sixty thousand connections over
+    # a ten-minute run on two hundred hosts, to learn nothing.
+    out="$(python3 -c '
+import sys; sys.path.insert(0, sys.argv[1])
+import tx
+print(tx.poll_interval(0), tx.poll_interval(60), tx.poll_interval(600),
+      tx.poll_interval(99999), tx.poll_interval(99999, 5.0))
+' "$REPO_ROOT/test_orchestrator")"
+    read -r at0 at60 at600 far pinned <<< "$out"
+    assert_eq "2.0" "$at0" "it should start responsive"
+    assert_eq "6.0" "$at60" "and grow with the wait"
+    assert_eq "30.0" "$at600" "up to a ceiling"
+    assert_eq "30.0" "$far" "that it does not exceed"
+    assert_eq "5.0" "$pinned" "--poll pins it"
+}
+
+t_a_poll_interval_that_cannot_mean_anything_is_refused() {
+    install_fake_ssh
+    plan="$(sweep_plan a b)"
+    for bad in 0 -1; do
+        run_tx run --plan "$plan" --poll "$bad"
+        assert_status 2 "$RUN_RC" "--poll $bad should be refused"
+        assert_contains "$RUN_OUT" "--poll"
+    done
+}
+
 # ---- refusals ---------------------------------------------------------------
 
 t_a_wave_size_that_cannot_mean_anything_is_refused() {
@@ -223,6 +356,12 @@ run_test "the spread does not overclaim"       t_the_spread_does_not_claim_the_w
 run_test "a failing job does not stop it"      t_a_failing_job_does_not_stop_the_sweep
 run_test "stop-on-fail names the unreached"    t_stop_on_fail_stops_and_says_who_was_never_reached
 run_test "a wave that cannot start is named"   t_a_wave_that_cannot_start_is_named_not_skipped_silently
+run_test "a killed sweep is resumed"           t_a_killed_sweep_is_resumed_from_the_fleets_own_record
+run_test "resume waits for live work"          t_resume_waits_for_hosts_still_running_rather_than_restarting_them
+run_test "resuming a finished sweep"           t_resuming_a_finished_sweep_does_nothing
+run_test "resume needs waves"                  t_resume_needs_waves_to_resume
+run_test "the poll backs off"                  t_the_poll_backs_off_the_longer_it_waits
+run_test "an impossible poll interval"         t_a_poll_interval_that_cannot_mean_anything_is_refused
 run_test "an impossible wave size"             t_a_wave_size_that_cannot_mean_anything_is_refused
 run_test "stop-on-fail needs waves"            t_stop_on_fail_without_waves_is_refused
 report_tests
