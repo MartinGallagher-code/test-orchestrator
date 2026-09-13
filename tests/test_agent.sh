@@ -175,6 +175,33 @@ t_teardown_runs_even_when_the_job_failed() {
     assert_file_exists "$WD/out/tidied"
 }
 
+t_a_host_is_not_finished_until_it_has_been_put_back() {
+    # `tx run` collects the moment a host reports finished. If the record
+    # said "done" before teardown had run, the collection would race a
+    # teardown still writing into $TX_OUT -- and the files it produced
+    # would be left on the host. Caught by the 3.6 job, which is slow
+    # enough to lose the race every time.
+    install_fake_ssh
+    plan="$(plan_for --run 'echo early > "$TX_OUT/early"' \
+            --teardown 'sleep 3; echo late > "$TX_OUT/late"' \
+            --tag t --timeout 30 -- web01)"
+    run_tx run --plan "$plan" --start-in 1 --no-skew-check -d results --quiet
+    assert_status 0 "$RUN_RC"
+    assert_file_exists "results/t~web01~out~early"
+    assert_file_exists "results/t~web01~out~late" \
+        "the collection raced the teardown and left its output behind"
+}
+
+t_a_host_running_its_teardown_says_so() {
+    install_fake_ssh
+    plan="$(plan_for --run true --teardown 'sleep 4' --tag t --timeout 30 \
+            -- web01)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    sleep 2.5
+    run_tx status --plan "$plan"
+    assert_contains "$RUN_OUT" "TIDYING"
+}
+
 t_a_teardown_that_failed_is_said_out_loud() {
     install_fake_ssh
     plan="$(plan_for --run true --teardown 'exit 4' --timeout 30 -- web01)"
@@ -238,6 +265,8 @@ run_test "setup runs before the job"           t_setup_runs_before_the_job
 run_test "a failed setup skips the job"        t_a_host_whose_setup_failed_does_not_run_the_job
 run_test "setup output is kept"                t_setup_output_is_kept_for_reading_later
 run_test "teardown runs after a failure"       t_teardown_runs_even_when_the_job_failed
+run_test "not finished until put back"         t_a_host_is_not_finished_until_it_has_been_put_back
+run_test "a host tidying says so"              t_a_host_running_its_teardown_says_so
 run_test "a failed teardown is said"           t_a_teardown_that_failed_is_said_out_loud
 run_test "an overrunning job is killed"        t_a_job_that_overruns_is_killed_and_marked
 run_test "a timeout takes the whole tree"      t_a_timeout_takes_the_whole_tree_with_it

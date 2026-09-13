@@ -91,6 +91,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A host reported itself finished before its teardown had run**, so
+  `tx run` collected while the teardown was still writing into `$TX_OUT`
+  and left its output on the host. Leaving a machine as it was found is
+  part of the run, so a host is not finished until it has been put back:
+  the record now says `tidying` while the teardown runs, and only then
+  `done`. `tx status` shows it, and `tx summarize` counts such a host as
+  still going rather than as one that has finished.
+
+  Found by the Python 3.6 CI job, which runs in a container slow enough
+  to lose the race every time; on faster interpreters the teardown
+  usually won.
+
 - **A job that could not start left its host reading `RUNNING` for
   ever.** The record is written before the job is launched, so a launch
   that threw -- no `bash`, a working directory that went away -- escaped

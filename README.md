@@ -86,7 +86,7 @@ agents to install, no packages, no root. Key-based SSH must already work
 |---|---|
 | `tx gen` | Build `plan.ini` from your server list. |
 | `tx start` | Copy the job to every host and arm them all for one instant. |
-| `tx status` | One line per host: `ARMED`, `RUNNING`, `DONE exit 0`, `TIMEOUT`. |
+| `tx status` | One line per host: `ARMED`, `RUNNING`, `TIDYING`, `DONE exit 0`, `TIMEOUT`. |
 | `tx collect` | Bring the results back into one directory, named by host. |
 | `tx summarize` | Who passed, who failed, who was slow — and how tight the start was. |
 | `tx clean` | Stop, then delete everything. No trace left. |
@@ -261,6 +261,11 @@ it is a wrong answer rather than a missing one. The report says so, and
 **`--teardown` runs afterwards**, pass or fail, so a host is left as it
 was found. That is not conditional on the run going well — it is exactly
 when cleanup matters most.
+
+A host is not *finished* until it has been put back: while the teardown
+runs the host reads `TIDYING`, and `tx run` waits for that before
+collecting. Otherwise the collection would race a teardown still writing
+into `$TX_OUT` and leave its output behind.
 
 ### What the job reads, and what it says
 

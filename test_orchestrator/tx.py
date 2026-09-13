@@ -858,20 +858,28 @@ def cmd_agent(args):
     report["finished_at"] = time.time()
     report["duration"] = report["finished_at"] - started
     report["exit"] = rc
-    report["state"] = "timeout" if report["timed_out"] else "done"
     # The last of the job's stderr, carried in the record so `tx status`
     # and `tx summarize` can say *why* a host failed without anybody
     # having to collect the run and go looking. The file still comes back
     # whole; this is the part you read first.
     report["stderr_tail"] = _tail_text(STDERR_NAME)
-    _write_json(REPORT_NAME, report)
 
     # Teardown runs whether the job passed, failed or was killed: leaving
     # a host as it was found is not conditional on the run going well.
+    #
+    # The host is not *finished* until it has been put back, and saying
+    # so before then is not a wording problem: `tx run` collects the
+    # moment a host reports finished, so a teardown still writing into
+    # $TX_OUT would have its output collected halfway or not at all.
+    # Hence a state of its own while it runs.
     if teardown_cmd:
+        report["state"] = "tidying"
+        _write_json(REPORT_NAME, report)
         report["teardown_exit"] = _run_phase(
             teardown_cmd, workdir, env, TEARDOWN_LOG, args.timeout)
-        _write_json(REPORT_NAME, report)
+
+    report["state"] = "timeout" if report["timed_out"] else "done"
+    _write_json(REPORT_NAME, report)
 
     return 0 if rc == 0 and not report["timed_out"] else 1
 
@@ -1196,6 +1204,8 @@ def _state_line(alive, report, word):
                                   "not start")
     if not alive:
         return "GONE      the agent is not running and left no result"
+    if state == "tidying":
+        return "TIDYING   exit %s, running the teardown" % report.get("exit")
     if state == "running":
         began = report.get("started_at")
         if began:
@@ -1248,7 +1258,8 @@ def _still_working(entry):
     """
     alive, report, word = entry
     if report is not None:
-        return report.get("state") in ("armed", "running", "setup")
+        return report.get("state") in ("armed", "running", "setup",
+                                       "tidying")
     return alive or word == "NOT-STARTED-YET"
 
 
@@ -1609,7 +1620,8 @@ def render_summary(plan, states, args, waves=0):
     setup_bad = [r for r in reports if r.get("state") == "setup-failed"]
     never = [r for r in reports if r.get("state") == "launch-failed"]
     unfinished = [r for r in reports
-                  if r.get("state") in ("running", "armed", "setup")]
+                  if r.get("state") in ("running", "armed", "setup",
+                                        "tidying")]
 
     log("")
     log("tx -- %s   [%s]" % (plan.run, plan.tag))
