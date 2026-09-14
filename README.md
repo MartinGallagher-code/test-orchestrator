@@ -233,6 +233,72 @@ fixed interval.
 
 ---
 
+## Drawing the work from a pool
+
+`--batch` walks a fleet the plan names, and the plan is the whole world:
+run the same sweep twice and it covers the same hosts in the same order.
+`--muster` walks a **pool** somebody else is keeping — [binnacle][b]'s
+`muster`, which hands work out under a lease, once each, and is the one
+thing that knows what is still outstanding across every machine drawing
+from it.
+
+```bash
+muster add 'web[01-200]'                        # put the work in the pool
+tx run --muster --batch 10 --lease 2h -d results
+```
+
+```text
+[tx] drawing from the pool muster.csv, 10 at a time, lease 2h -> results/
+
+[tx] === wave 1: 10 item(s) from the pool: web01 web02 web03 ... ===
+...
+[tx] checking 10 item(s) back in as done
+
+[tx] === wave 2: 10 item(s) from the pool: web11 web12 web13 ... ===
+...
+[tx] the pool has nothing available.
+
+  PROGRESS   200 of 200 done (100%), 0 held, 0 available
+```
+
+tx takes `--batch` items, runs that lot as one armed-together wave,
+and checks them straight back in: an item the host has a run record for
+is **done** — a job that ran and failed is a measurement, not an item to
+hand to the next worker to fail identically — and one nothing reached is
+**released** for somebody else. Then it asks for more, until the pool has
+nothing left to give it.
+
+The division of labour is the whole point. **muster owns what is
+outstanding; tx owns what happens to the items it is holding.** Neither
+keeps a copy of the other's record, so:
+
+- **Many machines can run one sweep.** Point several `tx run --muster`
+  at the same pool (a shared filesystem, or muster's own locking) and
+  they draw from it without ever taking the same item twice. The pool
+  is the coordination; tx does none of its own.
+
+- **A killed sweep needs no `--resume`.** A sweep that dies holding
+  twenty items leaves twenty leases that simply expire, and the items
+  are back in the pool without anything having to notice — no reaper, no
+  cleanup, nothing local that was lost. That is why `--muster` and
+  `--resume` do not go together: the pool is already the record.
+
+The pool decides *which* items and in what order; the plan stays the
+**address book**. An item the plan names is reached at the address the
+plan gives it (so a fleet can sit behind aliases); an item the plan does
+not name is its own address, so a pool of bare hostnames works against a
+plan that lists none of them.
+
+`--lease` sets how long each wave holds its items; the default is twice
+the wave's own time bound, so a lease always outlasts the work it covers.
+Too short, and an item goes back to the pool while tx is still running it
+— the one thing the lease exists to prevent. `--muster-cmd` names how to
+invoke muster when it is not simply `muster` on the `PATH`.
+
+[b]: https://github.com/MartinGallagher-code/binnacle
+
+---
+
 ## Shipping the job
 
 `--payload` is a file or a directory. It is packed once, sent to every

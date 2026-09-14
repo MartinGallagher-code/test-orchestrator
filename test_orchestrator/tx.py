@@ -1816,6 +1816,8 @@ def _wait_deadline(args, plan):
 
 def cmd_run(args):
     plan = load_plan(args.plan)
+    if args.muster is not None:
+        return run_from_muster(args, plan)
     if args.batch is not None:
         return run_in_waves(args, plan)
 
@@ -1985,6 +1987,319 @@ def run_in_waves(args, plan):
     rc = render_summary(plan, states, args, waves=len(waves))
     log("[tx] results: %s/" % args.dir)
     return 1 if (rc or trouble) else 0
+
+
+# ---------------------------------------------------------------------------
+# Coverage: a pool of work, a few items at a time
+# ---------------------------------------------------------------------------
+#
+# `--batch` marches through a fleet the plan names, and the plan is the
+# whole world: the same sweep run twice covers the same hosts. `--muster`
+# marches through a *pool* somebody else is keeping. binnacle's `muster`
+# hands items out under a lease, once each, and is the one thing that
+# knows what is still outstanding -- across however many machines are
+# drawing from it. tx takes X of them, runs that lot as one wave, checks
+# them back in, and asks for X more until the pool has nothing left.
+#
+# The division of labour is the point, and it is what makes this worth
+# having over `--batch` on a longer list. muster owns what is outstanding.
+# tx owns what happens to the items it is holding. Neither keeps a copy
+# of the other's record, so there is nothing to reconcile when one of them
+# is killed -- a sweep that dies holding twenty items does not have to be
+# found and cleaned up after, because an expired lease is not a lease and
+# those twenty are back in the pile without anything having to notice.
+
+DEFAULT_MUSTER = "muster"
+
+
+def _muster(args, verb, rest, quiet=True):
+    """One muster verb, against the pool. Returns (rc, stdout).
+
+    muster's exit codes are 0 for nothing wrong, 1 for something worth
+    seeing -- a CONFLICT, an unknown item -- and 2 for a usage error or a
+    pool that could not be locked. Only 2 means the bookkeeping did not
+    happen, and carrying on from there would run work the pool has no
+    record of being out, so that is the one that stops the sweep.
+    """
+    argv = (args.muster_cmd or DEFAULT_MUSTER).split() + [verb]
+    argv += ["--pool", args.muster]
+    if quiet:
+        argv.append("--quiet")
+    argv += list(rest)
+    try:
+        p = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE)
+        out, err = p.communicate()
+    except OSError as exc:
+        die("cannot run %s: %s\n"
+            "    --muster wants binnacle's `muster` on PATH (pip install "
+            "binnacle), or name it with --muster-cmd" % (argv[0], exc))
+    out = (out or b"").decode("utf-8", "replace")
+    err = (err or b"").decode("utf-8", "replace")
+    # With --quiet, what is left on stderr is what muster thought was
+    # worth saying anyway: a CONFLICT naming two holders, an item that is
+    # not in the pool. Passing it through is the difference between a
+    # sweep that quietly did work twice and one that said so.
+    for line in err.splitlines():
+        if line.strip():
+            log("  muster: %s" % line.rstrip())
+    if p.returncode >= 2:
+        die("muster %s: the pool could not be read or written, so nothing "
+            "was leased and nothing was run" % verb)
+    return p.returncode, out
+
+
+def _ticket_parts(path):
+    """A ticket's comment header and its items, kept apart.
+
+    The header is not decoration: it carries the lease line, and that is
+    how `muster done` tells this sweep's completion from somebody else's.
+    So a wave that checks in only some of what it took writes a fresh
+    ticket with the same header and fewer items, rather than naming them
+    with --item and throwing the lease away -- which would turn a
+    reportable CONFLICT into a silent one.
+    """
+    head, items = [], []
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.rstrip("\n").rstrip("\r")
+                if line.startswith("#"):
+                    head.append(line)
+                elif line.strip():
+                    items.extend(line.split())
+    except (IOError, OSError) as exc:
+        die("cannot read the ticket muster wrote (%s): %s" % (path, exc))
+    return head, items
+
+
+def _check_in(args, path, verb, head, items):
+    """Hand a lot of items back, under the lease they were taken on."""
+    if not items:
+        return 0
+    try:
+        with open(path, "w") as fh:
+            fh.write("\n".join(head + list(items)) + "\n")
+    except (IOError, OSError) as exc:
+        die("cannot write %s: %s" % (path, exc))
+    rc, _out = _muster(args, verb, [path])
+    return rc
+
+
+def _plan_over(plan, items, addrs):
+    """The same job, over hosts the plan need not have named.
+
+    slice_plan narrows a plan to hosts it already lists. This builds one
+    over names that came from somewhere else, which is what a pool is.
+    """
+    return Plan(plan.path, list(items),
+                dict((i, addrs[i]) for i in items),
+                plan.run, plan.setup, plan.teardown, plan.payload,
+                plan.timeout, plan.collect, plan.tag, plan.remote_dir,
+                plan.stdin)
+
+
+def muster_addr(plan, item):
+    """Where to ssh to for a pool item.
+
+    The pool decides *which* work is done and in what order; the plan
+    stays the address book. An item the plan names is reached at the
+    address the plan gives it, so a fleet can sit behind aliases or be
+    renamed without the pool being told. An item the plan does not name
+    is its own address, which is what makes a pool of bare hostnames work
+    against a plan that lists none of them.
+    """
+    return plan.addrs.get(item, item)
+
+
+def muster_lease(args, plan):
+    """How long to hold a wave's items for, if nobody said.
+
+    The lease has to outlast the wave or the items go back in the pile
+    while tx is still working on them, and somebody else runs the same
+    benchmark on the same host -- which is the one thing the pool exists
+    to prevent. muster's own default is an hour, and a job with a
+    two-hour timeout would quietly outlive it, so the default here is the
+    wave's own bound with room on top rather than a number picked flat.
+    """
+    if args.lease:
+        return args.lease
+    bound = plan.timeout + arm_delay(args.batch, args.start_in) + 60
+    return "%ds" % int(bound * 2 + 300)
+
+
+def run_from_muster(args, plan):
+    """Cover a pool of work, X items at a time, checking each lot back in.
+
+    One loop: take X, run them as a wave, and give them back -- items
+    that ran are done, items nothing ran on are released for somebody
+    else. It ends when the pool has nothing left to hand out.
+
+    "Nothing left to hand out" is deliberately not "the pool is
+    complete". Other workers may be holding the rest, and a sweep that
+    waited around for them would be inventing a coordination problem the
+    lease already solves. So this covers what it can get, and prints
+    muster's own account of the pool at the end rather than claiming to
+    know the job is finished.
+    """
+    states = {}
+    trouble = []
+    addrs = {}
+    taken = []          # every item this sweep ran, in the order taken
+    seen = set()
+    # Items that were leased and never run: released in one go at the
+    # end, not as they happen. Released immediately they would be
+    # available again at once, and the very next take would hand the
+    # same unreachable host straight back -- a sweep that never ends,
+    # spinning on the one rack that is down.
+    holding = []
+    # Chosen once, before the first wave: the default is stamped with
+    # the time, and a fresh directory per wave would scatter one sweep
+    # across ten of them.
+    args.dir = default_dir(args.dir)
+    lease = muster_lease(args, plan)
+
+    tmp = tempfile.mkdtemp(prefix="tx-muster-")
+    ticket = os.path.join(tmp, "ticket.txt")
+    handback = os.path.join(tmp, "handback.txt")
+    log("[tx] drawing from the pool %s, %d at a time, lease %s -> %s/"
+        % (args.muster, args.batch, lease, args.dir))
+    wave = 0
+    try:
+        while True:
+            _rc, _out = _muster(args, "take",
+                                [str(args.batch), "-o", ticket,
+                                 "--lease", lease])
+            head, items = _ticket_parts(ticket)
+            # An item we have already run coming back means its lease
+            # lapsed mid-sweep and the pool offered it to us again.
+            # Running it twice is exactly what the pool is for
+            # preventing, so it is held rather than re-run, and goes
+            # back with the rest at the end.
+            again = [i for i in items if i in seen]
+            fresh = [i for i in items if i not in seen]
+            if again:
+                log("[tx] %d item(s) came back with a lapsed lease; holding "
+                    "them rather than running them a second time" % len(again))
+                holding.append((head, again))
+            if not fresh:
+                if not items:
+                    log("[tx] the pool has nothing available.")
+                break
+
+            wave += 1
+            for item in fresh:
+                addrs[item] = muster_addr(plan, item)
+            seen.update(fresh)
+            taken.extend(fresh)
+            sub = _plan_over(plan, fresh, addrs)
+
+            log("")
+            log("[tx] === wave %d: %d item(s) from the pool: %s ==="
+                % (wave, len(fresh), " ".join(fresh[:8])
+                   + (" ..." if len(fresh) > 8 else "")))
+
+            if cmd_start(args, sub):
+                # cmd_start has already stood this wave back down, so
+                # nothing ran on any of them. They go back unfinished:
+                # marking them done would report a benchmark that never
+                # happened as a host that passed.
+                trouble.append(wave)
+                for item in fresh:
+                    states[item] = (False, None, "WAVE DID NOT START")
+                holding.append((head, fresh))
+                if args.stop_on_fail:
+                    log("[tx] --stop-on-fail: not taking any more from the "
+                        "pool")
+                    break
+                continue
+
+            deadline = _wait_deadline(args, sub)
+            wave_states, finished = _wait_for_fleet(
+                Fleet(sub, args), deadline, pinned=args.poll)
+            # Recorded now, while the record is still on the hosts: the
+            # collection below, and a --clean after it, are about to take
+            # it away.
+            states.update(wave_states)
+            if not finished:
+                log("[tx] wave %d had hosts still running when the wait ran "
+                    "out; collecting what there is" % wave)
+                trouble.append(wave)
+            if cmd_collect(args, sub):
+                trouble.append(wave)
+            if args.clean:
+                args.yes = True
+                cmd_clean(args, sub)
+
+            # The check-in, and the whole judgement in this mode, in
+            # three parts:
+            #
+            #   ran      -- the host has a run record. Done: the work
+            #               happened, and a job that ran and failed is a
+            #               measurement, not an item to hand to the next
+            #               worker to fail identically.
+            #   working  -- no record yet and the agent is still going.
+            #               This is only reached on a wait that timed out;
+            #               the agent is detached, so the work outlived
+            #               the wait. Neither done nor released -- letting
+            #               its lease expire is the one safe answer, since
+            #               handing a still-running host to a second
+            #               worker is the duplicate the pool exists to
+            #               prevent.
+            #   idle     -- reached, nothing running, no record. Never
+            #               measured, so it goes back for somebody else.
+            ran = [i for i in fresh
+                   if _has_result(states.get(i, (False, None, "")))]
+            done_set = set(ran)
+            working = [i for i in fresh if i not in done_set
+                       and _still_working(states.get(i, (False, None, "")))]
+            work_set = set(working)
+            idle = [i for i in fresh
+                    if i not in done_set and i not in work_set]
+            if ran:
+                log("[tx] checking %d item(s) back in as done" % len(ran))
+                if _check_in(args, handback, "done", head, ran):
+                    trouble.append(wave)
+            if working:
+                log("[tx] leaving %d item(s) still running to their lease "
+                    "rather than handing them out again" % len(working))
+            if idle:
+                holding.append((head, idle))
+            if args.stop_on_fail and not finished:
+                log("[tx] --stop-on-fail: not taking any more from the pool")
+                break
+
+        # Everything that was leased and never measured, put back in one
+        # go now that no further take can pick it up again.
+        stranded = sum(len(items) for _h, items in holding)
+        if stranded:
+            log("")
+            log("[tx] putting %d item(s) back: nothing ran on them"
+                % stranded)
+            for head, items in holding:
+                if _check_in(args, handback, "release", head, items):
+                    trouble.append(0)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    if not taken:
+        log("[tx] nothing was taken, so nothing was run.")
+        _muster(args, "status", [], quiet=False)
+        return 1 if trouble else 0
+
+    for item in taken:
+        states.setdefault(item, (False, None, "NOT REACHED"))
+    rc = render_summary(_plan_over(plan, taken, addrs), states, args,
+                        waves=wave)
+    log("[tx] results: %s/" % args.dir)
+    # The pool's own last word, printed rather than paraphrased: how much
+    # is left is muster's number, and a second opinion from tx -- which
+    # has only ever seen what it was handed -- would be a worse one.
+    log("")
+    _rc, out = _muster(args, "status", [], quiet=False)
+    sys.stdout.write(out)
+    return 1 if (rc or trouble) else 0
+
 
 
 # ---------------------------------------------------------------------------
@@ -2192,6 +2507,14 @@ HINTS = [
      "whole fleet a few hosts at a time, each wave armed for its own "
      "instant, everything landing in one directory. It is not --jobs, "
      "which is only how many ssh connections are open."),
+    ("draw the work from a shared pool, once each, across many machines",
+     "muster add 'web[01-40]' && tx run --muster --batch 10 -d results",
+     "tx run --muster patching.csv --batch 10 --lease 2h -d results",
+     "binnacle's muster hands items out under a lease and knows what is "
+     "still outstanding; tx takes --batch of them, runs them as one wave, "
+     "and checks them back in (done if they ran, released if nothing "
+     "reached them) until the pool is empty. Several tx's can draw from "
+     "one pool at once and never take the same item twice."),
     ("prove the runs really were simultaneous",
      "tx summarize",
      "",
@@ -2390,6 +2713,28 @@ def build_parser():
                         "result and cover only what is left. The fleet "
                         "itself is the record, so a sweep survives its "
                         "own orchestrator being killed")
+    r.add_argument("--muster", nargs="?",
+                   const=_env("MUSTER_POOL", "muster.csv"), default=None,
+                   metavar="POOL",
+                   help="draw the work from a binnacle muster pool instead "
+                        "of the plan's whole host list: take --batch items "
+                        "under a lease, run them as one wave, check them "
+                        "back in (done if they ran, released if nothing "
+                        "reached them), and ask for more until the pool has "
+                        "none left. The plan stays the address book; the "
+                        "pool decides which items and in what order. "
+                        "Defaults to muster.csv (or $MUSTER_POOL)")
+    r.add_argument("--muster-cmd", default=_env("TX_MUSTER", ""),
+                   metavar="CMD",
+                   help="how to invoke muster (default: `muster` on PATH). "
+                        "Use e.g. 'python3 -m binnacle.muster' when it is "
+                        "not installed as a script")
+    r.add_argument("--lease", default="", metavar="DUR",
+                   help="with --muster, how long each wave holds its items "
+                        "for -- 30m, 2h, 90 (seconds). The default is twice "
+                        "the wave's own time bound, so a lease outlasts the "
+                        "work it covers; too short and an item goes back to "
+                        "the pool while tx is still running it")
     r.add_argument("--poll", type=float, default=None, metavar="S",
                    help="seconds between status checks while waiting "
                         "(default: from 2s, growing to 30s the longer the "
@@ -2449,7 +2794,8 @@ def cmd_full_help(ap):
     log("")
     log("environment variables (each is the default for the matching flag):")
     log("  TX_PLAN TX_SERVERS TX_REMOTE_DIR TX_DIR TX_USER (or SSH_USER)")
-    log("  TX_JOBS TX_PYTHON")
+    log("  TX_JOBS TX_PYTHON TX_MUSTER (how to invoke muster)")
+    log("  MUSTER_POOL   the default pool for --muster, shared with muster")
     return 0
 
 
@@ -2488,9 +2834,22 @@ def main(argv=None):
         die("--resume picks up a --batch sweep where it stopped; without "
             "--batch there are no waves to resume")
     if (getattr(args, "stop_on_fail", False)
-            and getattr(args, "batch", None) is None):
+            and getattr(args, "batch", None) is None
+            and getattr(args, "muster", None) is None):
         die("--stop-on-fail is about the waves --batch makes; without it "
             "there is only one wave and nothing to stop")
+    if getattr(args, "muster", None) is not None:
+        if getattr(args, "batch", None) is None:
+            die("--muster draws the work a wave at a time, so it needs "
+                "--batch N to say how many items each wave takes from the "
+                "pool")
+        if getattr(args, "resume", False):
+            die("--muster and --resume do not go together: the pool is "
+                "already the record of what is left, so a muster sweep "
+                "resumes itself -- just run it again")
+    elif getattr(args, "lease", ""):
+        die("--lease sets how long a --muster wave holds its items; "
+            "without --muster there is no pool and no lease to set")
     try:
         return COMMANDS[args.cmd](args) or 0
     except KeyboardInterrupt:

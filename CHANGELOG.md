@@ -13,6 +13,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`tx run --muster` draws the work from a binnacle muster pool instead
+  of the plan's host list.** `--batch` walks a fleet the plan names;
+  `--muster` walks a pool `muster` is keeping, which hands items out
+  under a lease, once each, and knows what is still outstanding across
+  every machine drawing from it. tx takes `--batch` items, runs them as
+  one armed-together wave, and checks them back in -- done if the host
+  has a run record (a job that ran and failed is a measurement, not an
+  item to hand to the next worker), released if nothing reached it --
+  and asks for more until the pool has nothing left.
+
+  The division of labour is the point: muster owns what is outstanding,
+  tx owns what happens to the items it holds, and neither keeps a copy
+  of the other's record. So several `tx run --muster` can share one pool
+  and never take the same item twice, and a sweep that is killed leaves
+  leases that simply expire -- there is nothing local to lose and no
+  `--resume` to run. The plan stays the address book: an item it names
+  is reached at the address it gives, an item it does not name is its
+  own address, so a pool of bare hostnames needs no plan hosts at all.
+  `--lease` sets how long a wave holds its items (default: twice the
+  wave's own time bound); `--muster-cmd` names how to invoke muster when
+  it is not `muster` on the `PATH`.
+
 - **`tx run --batch --resume` picks a sweep up from the fleet's own
   record.** A ten-wave sweep can take hours and `tx run` has to stay
   alive to sequence it; if it does not, nothing local is lost, because
