@@ -90,6 +90,13 @@ DEFAULT_PLAN = "plan.ini"
 DEFAULT_SERVERS = "servers.txt"
 DEFAULT_REMOTE_DIR = "/var/tmp/tx"
 DEFAULT_TIMEOUT = 3600.0
+
+# Per file, on collection. A benchmark's results are usually small and
+# the thing this stops is the exception: a core dump, a heap profile, a
+# log that ran away. Refused on the host, so the bytes never travel --
+# and always named, because a result silently not collected is worse
+# than one you were told about.
+DEFAULT_MAX_BYTES = 100 << 20
 DEFAULT_JOBS = 64
 
 # How far ahead of now the synchronised start is armed. Every host has to
@@ -130,6 +137,12 @@ SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=8"]
 # The pgrep pattern is bracketed so the very shell running it is not
 # itself a match: that shell's command line contains the literal
 # "[t]x.py agent", which the regex "tx.py agent" does not match.
+# What a host says when it could not check whether an agent survived --
+# no pgrep there, and a missing pgrep is indistinguishable from "none
+# found". The difference matters: one is a clean host, the other is an
+# unanswered question.
+UNVERIFIED = "UNVERIFIED"
+
 PGREP = "pgrep -f '[t]x[.]py agent'"
 PKILL = "pkill -%s -f '[t]x[.]py agent'"
 
@@ -509,9 +522,18 @@ class Fleet(object):
             log("[tx] %s on %d hosts" % (label, len(hosts)))
         with ThreadPoolExecutor(max_workers=self.jobs) as pool:
             results = list(pool.map(fn, hosts))
+        return self.report(hosts, dict(zip(hosts, results)), quiet)
+
+    def report(self, hosts, results, quiet=False):
+        """Print one host per line, in plan order, and count the failures.
+
+        Separate from each() so a command can read what the fleet said
+        *and* print it the usual way, without asking twice.
+        """
         width = max(len(h) for h in hosts)
         failed = []
-        for host, (rc, text) in zip(hosts, results):
+        for host in hosts:
+            rc, text = results[host]
             if rc != 0:
                 failed.append(host)
             if quiet and rc == 0:
@@ -1368,12 +1390,19 @@ def default_dir(base=None):
     return "%s-%d" % (stamp, os.getpid())
 
 
-def _collect_script(rdir, patterns):
+# What a host says on stderr about a file it did not send. stdout is the
+# tar, so the report of what was left behind travels beside it.
+OVERSIZE_MARK = "tx-oversize"
+
+
+def _collect_script(rdir, patterns, max_bytes):
     """A tar of everything worth bringing back, on stdout.
 
     One round trip per host, whole files, framed by tar itself. The file
     list is built on the far side because that is the only side that
-    knows what the job produced.
+    knows what the job produced -- and the size ceiling is applied there
+    too, so an oversized file is never put on the wire at all. What was
+    left behind is named on stderr, which the tar on stdout leaves free.
     """
     extra = " ".join(shlex.quote(p) for p in patterns)
     return """
@@ -1397,9 +1426,29 @@ list=$(
 )
 set +f
 [ -n "$list" ] || {{ echo 'tx: nothing to collect' >&2; exit 3; }}
-printf '%s\\n' "$list" | sort -u | tar cf - -T - 2>/dev/null
+# The ceiling. `ls -ln` reads the inode, not the file, so measuring a
+# four-gigabyte core dump costs nothing -- and refusing it here means it
+# never crosses the network, which is the whole point of a ceiling.
+max={max}
+keep=""
+if [ "$max" -gt 0 ]; then
+    for f in $(printf '%s\\n' "$list" | sort -u); do
+        sz=$(ls -ln "$f" 2>/dev/null | awk '{{print $5}}')
+        [ -z "$sz" ] && sz=0
+        if [ "$sz" -gt "$max" ]; then
+            printf '{mark}\\t%s\\t%s\\n' "$f" "$sz" >&2
+        else
+            keep="$keep$f
+"
+        fi
+    done
+else
+    keep=$(printf '%s\\n' "$list" | sort -u)
+fi
+[ -n "$keep" ] || exit 0
+printf '%s\\n' "$keep" | sort -u | tar cf - -T - 2>/dev/null
 """.format(d=shlex.quote(rdir), always=" ".join(ALWAYS), out=OUT_NAME,
-           extra=extra or "''")
+           extra=extra or "''", max=int(max_bytes), mark=OVERSIZE_MARK)
 
 
 def _clean_relpath(name):
@@ -1461,8 +1510,30 @@ def _extract(blob, dest, tag, host, taken):
     return written, total, clashes
 
 
+def _split_oversize(err):
+    """Pull the host's oversize report out of its stderr.
+
+    stdout carries the tar, so what a host refused to send travels on
+    stderr beside it. Returns (skipped, whatever else stderr said) --
+    the rest still matters, because a real error can arrive on the same
+    stream.
+    """
+    skipped, rest = [], []
+    for line in (err or "").splitlines():
+        if line.startswith(OVERSIZE_MARK + "\t"):
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                try:
+                    skipped.append((parts[1], int(parts[2])))
+                    continue
+                except ValueError:
+                    pass
+        rest.append(line)
+    return skipped, "\n".join(rest).strip()
+
+
 class Collected(object):
-    __slots__ = ("host", "files", "bytes", "error", "clashes")
+    __slots__ = ("host", "files", "bytes", "error", "clashes", "skipped")
 
     def __init__(self, host):
         self.host = host
@@ -1470,6 +1541,9 @@ class Collected(object):
         self.bytes = 0
         self.error = ""
         self.clashes = []
+        # (path, size) for anything over --max-bytes, so the report can
+        # name what it did not bring back.
+        self.skipped = []
 
 
 def cmd_collect(args, plan=None):
@@ -1478,7 +1552,8 @@ def cmd_collect(args, plan=None):
     dest = default_dir(args.dir)
     if fleet.dry_run:
         log("# %d host(s): %s" % (len(plan.hosts), " ".join(plan.hosts[:8])))
-        sys.stdout.write(_collect_script(fleet.dir, plan.collect))
+        sys.stdout.write(_collect_script(fleet.dir, plan.collect,
+                                         args.max_bytes))
         return 0
     try:
         os.makedirs(dest)
@@ -1486,7 +1561,7 @@ def cmd_collect(args, plan=None):
         if exc.errno != errno.EEXIST:
             die("cannot create %s: %s" % (dest, exc))
 
-    script = _collect_script(fleet.dir, plan.collect)
+    script = _collect_script(fleet.dir, plan.collect, args.max_bytes)
     # Names are claimed under a lock-free protocol only because each host
     # owns a disjoint slice of the namespace (the host name is in every
     # name); the set is filled in plan order below, off the threads.
@@ -1498,9 +1573,10 @@ def cmd_collect(args, plan=None):
     for host in plan.hosts:
         r = Collected(host)
         rc, blob, err = blobs[host]
+        r.skipped, err = _split_oversize(err)
         if rc == 3:
             r.error = "nothing to collect (did the job run?)"
-        elif rc != 0 or not blob:
+        elif rc != 0 or (not blob and not r.skipped):
             r.error = err or "collection failed (exit %s)" % rc
         else:
             try:
@@ -1516,7 +1592,8 @@ def cmd_collect(args, plan=None):
 def _render_collection(results, dest, args):
     good = [r for r in results if r.files and not r.error]
     bad = [r for r in results if r.error]
-    empty = [r for r in results if not r.files and not r.error]
+    empty = [r for r in results
+             if not r.files and not r.error and not r.skipped]
     nfiles = sum(len(r.files) for r in results)
     nbytes = sum(r.bytes for r in results)
 
@@ -1533,7 +1610,25 @@ def _render_collection(results, dest, args):
     for r in clashed:
         log("  COLLISION %s: %d file(s) folded onto a name already taken: %s"
             % (r.host, len(r.clashes), " ".join(r.clashes[:3])))
-    if bad or empty or clashed:
+    # Named, with sizes, because "we did not bring this back" is only
+    # useful if you can tell what and decide whether you wanted it.
+    big = [r for r in results if r.skipped]
+    if big:
+        n = sum(len(r.skipped) for r in big)
+        log("  OVERSIZE  %d file%s over --max-bytes (%s), left where they are:"
+            % (n, "" if n == 1 else "s", fmt_bytes(args.max_bytes)))
+        shown = 0
+        for r in big:
+            for path, size in r.skipped:
+                if shown >= 6:
+                    break
+                log("            %-12s %8s  %s"
+                    % (r.host, fmt_bytes(size), path))
+                shown += 1
+        if n > shown:
+            log("            ... and %d more" % (n - shown))
+        log("            raise --max-bytes, or have the job write less.")
+    if bad or empty or clashed or big:
         log("")
 
     if not args.quiet:
@@ -1550,7 +1645,7 @@ def _render_collection(results, dest, args):
     # Exit 1 on an empty collection is deliberate: a script that fans out
     # to gather results and gathers none should stop, not carry on with
     # an empty directory.
-    return 1 if (bad or clashed or not nfiles) else 0
+    return 1 if (bad or clashed or big or not nfiles) else 0
 
 
 CSV_FIELDS = ["host", "local_path", "bytes"]
@@ -1785,15 +1880,38 @@ def cmd_clean(args, plan=None):
         if reply.strip().lower() != "yes":
             log("[tx] nothing done")
             return 1
+    # A host with no pgrep cannot be asked whether an agent survived, and
+    # a missing pgrep looks exactly like "no agents found" -- so it says
+    # so rather than letting the run claim a clean fleet it never checked.
     script = _kill_block(fleet.dir) + """
 rm -rf "$d"
 if [ -e "$d" ]; then echo "LEFTOVER: $d still exists"; exit 1; fi
-if {pgrep} >/dev/null 2>&1; then echo 'LEFTOVER: an agent is still running'; exit 1; fi
-echo "clean (was: $status)"
-""".format(pgrep=PGREP)
-    failed = fleet.each(lambda h: fleet.sh(h, script), "removing every trace")
+{pgrep} >/dev/null 2>&1
+found=$?
+# Three answers out of one exit status, which is the distinction that
+# was missing: 0 means an agent is still there, 1 means none is, and 127
+# means there is no pgrep to ask -- and reading that last one as "none
+# found" is how the run came to claim a clean fleet it never checked.
+if [ "$found" -eq 0 ]; then
+    echo 'LEFTOVER: an agent is still running'; exit 1
+elif [ "$found" -eq 127 ]; then
+    echo "clean (was: $status) -- {mark}: no pgrep here, so a stray agent could not be ruled out"
+else
+    echo "clean (was: $status)"
+fi
+""".format(pgrep=PGREP, mark=UNVERIFIED)
+    log("[tx] removing every trace on %d hosts" % len(plan.hosts))
+    results = fleet.gather(lambda h: fleet.sh(h, script))
+    failed = fleet.report(plan.hosts, results)
     if failed:
         return 1
+    unsure = [h for h in plan.hosts if UNVERIFIED in (results[h][1] or "")]
+    if unsure:
+        log("[tx] the working directory is gone from every host. On %d of "
+            "them there is no pgrep, so whether an agent outlived it is "
+            "unknown: %s"
+            % (len(unsure), " ".join(unsure[:8])))
+        return 0
     log("[tx] nothing of tx remains on the fleet -- no packages, no services, "
         "no leftover payload (there never were any)")
     return 0
@@ -2110,12 +2228,12 @@ running=no
 {pgrep} >/dev/null 2>&1 && running=yes
 free=$(df -Pk {d} 2>/dev/null | awk 'NR==2{{print $4}}')
 [ -z "$free" ] && free=$(df -Pk / 2>/dev/null | awk 'NR==2{{print $4}}')
-echo "$py; cores=$(nproc 2>/dev/null || echo ?); free=${{free:-?}}KB; tar=$(command -v tar >/dev/null && echo yes || echo NO); agent_running=$running"
+echo "$py; cores=$(nproc 2>/dev/null || echo ?); free=${{free:-?}}KB; tar=$(command -v tar >/dev/null && echo yes || echo NO); pgrep=$(command -v pgrep >/dev/null && echo yes || echo 'no (stop/clean cannot verify)'); agent_running=$running"
 """.format(py=shlex.quote(fleet.python), pgrep=PGREP,
            d=shlex.quote(os.path.dirname(fleet.dir) or "/"))
     log("")
     failed = fleet.each(lambda h: fleet.sh(h, script, timeout=30),
-                        "checking hosts (ssh + python + bash + tar + disk)")
+                        "checking hosts (ssh, python, bash, tar, pgrep, disk)")
     if failed:
         log("[tx] fix ssh/python on those hosts first: key-based ssh must "
             "work non-interactively (ssh-copy-id) and `%s` must exist."
@@ -2274,6 +2392,12 @@ def _add_collect_flags(p):
     p.add_argument("--timeout", type=float, default=900.0, metavar="S",
                    help="per-host limit on the transfer (default: "
                         "%(default)s)")
+    p.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES,
+                   metavar="N",
+                   help="refuse to bring back a file larger than this, and "
+                        "name it instead (default: %d, 0 for no ceiling). "
+                        "Applied on the host, so an oversized file never "
+                        "crosses the network" % DEFAULT_MAX_BYTES)
     p.add_argument("--csv", metavar="PATH", nargs="?", const="-",
                    help="also write one row per collected file")
     p.add_argument("--quiet", action="store_true",
@@ -2480,6 +2604,9 @@ def main(argv=None):
         die("--batch is how many hosts run at once, so it wants at least 1, "
             "got %d (leave it out to run the whole fleet together)"
             % args.batch)
+    if getattr(args, "max_bytes", 0) < 0:
+        die("--max-bytes is a size, so it cannot be negative; got %d "
+            "(0 means no ceiling)" % args.max_bytes)
     if getattr(args, "poll", None) is not None and args.poll <= 0:
         die("--poll is how many seconds to wait between status checks, so "
             "it wants a positive number, got %g (leave it out to let it "

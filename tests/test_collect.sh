@@ -170,6 +170,68 @@ t_an_empty_collection_is_an_exit_code() {
     assert_contains "$RUN_OUT" "0 files"
 }
 
+# ---- the size ceiling --------------------------------------------------------
+
+t_a_file_over_the_ceiling_is_named_not_fetched() {
+    # A core dump, a heap profile, a log that ran away: the exception a
+    # ceiling exists for. Refused on the host, so the bytes never travel.
+    install_fake_ssh
+    plan="$(ran_job --run 'head -c 200000 /dev/zero > "$TX_OUT/huge.bin"
+echo small > "$TX_OUT/note"' --tag j --timeout 30 -- web01)" \
+        || fail "the job never finished"
+    run_tx collect --plan "$plan" -d results --max-bytes 100000
+    assert_status 1 "$RUN_RC" "leaving a result behind is worth an exit code"
+    assert_contains "$RUN_OUT" "OVERSIZE"
+    assert_contains "$RUN_OUT" "out/huge.bin"
+    assert_contains "$RUN_OUT" "195.3KB"
+    assert_no_file "results/j~web01~out~huge.bin" "it should not have come back"
+    # Everything under the ceiling still did.
+    assert_file_exists "results/j~web01~out~note"
+    assert_file_exists "results/j~web01~run.json"
+}
+
+t_no_ceiling_brings_everything_back() {
+    install_fake_ssh
+    plan="$(ran_job --run 'head -c 200000 /dev/zero > "$TX_OUT/huge.bin"' \
+            --tag j --timeout 30 -- web01)" || fail "the job never finished"
+    run_tx collect --plan "$plan" -d results --max-bytes 0 --quiet
+    assert_status 0 "$RUN_RC"
+    assert_file_exists "results/j~web01~out~huge.bin"
+    assert_not_contains "$RUN_OUT" "OVERSIZE"
+}
+
+t_the_ceiling_is_applied_on_the_host_not_here() {
+    # If the filtering happened locally the bytes would already have
+    # crossed the network, which is the one thing a ceiling is for. The
+    # tar a host sends must simply not contain the file.
+    install_fake_ssh
+    plan="$(ran_job --run 'head -c 200000 /dev/zero > "$TX_OUT/huge.bin"' \
+            --tag j --timeout 30 -- web01)" || fail "the job never finished"
+    run_tx collect --plan "$plan" -d results --max-bytes 100000 --quiet
+    # The whole collection is smaller than the file that was refused.
+    total="$(find results -type f -exec cat {} + | wc -c | tr -d ' ')"
+    assert_between 0 100000 "$total" \
+        "the refused file appears to have travelled anyway ($total bytes)"
+}
+
+t_a_host_whose_every_file_is_too_big_is_not_called_empty() {
+    install_fake_ssh
+    plan="$(ran_job --run 'head -c 200000 /dev/zero > "$TX_OUT/huge.bin"' \
+            --tag j --timeout 30 -- web01)" || fail "the job never finished"
+    # A ceiling under even the run record, so nothing at all comes back.
+    run_tx collect --plan "$plan" -d results --max-bytes 1
+    assert_contains "$RUN_OUT" "OVERSIZE"
+    assert_not_contains "$RUN_OUT" "produced nothing"
+}
+
+t_a_ceiling_that_cannot_mean_anything_is_refused() {
+    install_fake_ssh
+    plan="$(plan_for --run true --timeout 30 -- web01)"
+    run_tx collect --plan "$plan" --max-bytes -1
+    assert_status 2 "$RUN_RC"
+    assert_contains "$RUN_OUT" "--max-bytes"
+}
+
 # ---- safety -----------------------------------------------------------------
 
 t_nothing_a_host_says_becomes_a_local_path() {
@@ -257,6 +319,11 @@ run_test "a glob matching nothing is fine"     t_a_glob_that_matches_nothing_is_
 run_test "binary results survive"              t_binary_results_survive_the_trip
 run_test "a host with nothing is named"        t_a_host_that_produced_nothing_is_named
 run_test "an empty collection exits 1"         t_an_empty_collection_is_an_exit_code
+run_test "a file over the ceiling is named"    t_a_file_over_the_ceiling_is_named_not_fetched
+run_test "no ceiling brings everything"        t_no_ceiling_brings_everything_back
+run_test "the ceiling applies on the host"     t_the_ceiling_is_applied_on_the_host_not_here
+run_test "all-too-big is not empty"            t_a_host_whose_every_file_is_too_big_is_not_called_empty
+run_test "an impossible ceiling is refused"    t_a_ceiling_that_cannot_mean_anything_is_refused
 run_test "no remote name becomes a path"       t_nothing_a_host_says_becomes_a_local_path
 run_test "two files on one name are caught"    t_two_files_folding_onto_one_name_are_caught
 run_test "a dry run contacts nothing"          t_a_dry_run_prints_the_command_and_contacts_nothing
