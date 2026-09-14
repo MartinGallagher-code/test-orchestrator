@@ -89,7 +89,7 @@ agents to install, no packages, no root. Key-based SSH must already work
 | `tx status` | One line per host: `ARMED`, `RUNNING`, `TIDYING`, `DONE exit 0`, `TIMEOUT`. |
 | `tx collect` | Bring the results back into one directory, named by host. |
 | `tx summarize` | Who passed, who failed, who was slow — and how tight the start was. |
-| `tx clean` | Stop, then delete everything. No trace left. |
+| `tx clean` | Stop, then delete everything. No trace left — and it says so only if it could check. |
 
 And six more when you want them: `tx run` (all of the above in one
 shot, and `--batch N` to cover the fleet a few hosts at a time), `tx
@@ -362,6 +362,20 @@ it is where anything the agent could not turn into a record ends up, and
 a run that went wrong is exactly when you need it. `--collect GLOB` adds anything else you want, evaluated
 on the host.
 
+**`--max-bytes` is the ceiling**, 100 MB per file by default. A benchmark's
+results are usually small and what this stops is the exception — a core
+dump, a heap profile, a log that ran away. It is applied *on the host*,
+so an oversized file never crosses the network, and it is always named
+rather than silently dropped:
+
+```text
+  OVERSIZE  1 file over --max-bytes (100.0MB), left where they are:
+            web12         4.1GB  out/core.20260913
+            raise --max-bytes, or have the job write less.
+```
+
+`--max-bytes 0` removes the ceiling.
+
 Nothing a remote host says is used as a local path. Names are rebuilt
 here from the host name and the path within its working directory, so a
 host answering with `../../etc/cron.d/x` writes inside the collection
@@ -425,6 +439,21 @@ base64'd from the plan to the agent, so no shell parses it on the way:
 quotes, newlines, `$(...)` and backslashes all survive.
 
 ---
+
+### What `tx clean` will and won't promise
+
+It removes the working directory, then asks whether any agent outlived
+it. That question is `pgrep`, and on a host without procps a missing
+`pgrep` looks exactly like `pgrep` finding nothing — so rather than read
+that as a clean host, it says what it actually knows:
+
+```text
+[tx] the working directory is gone from every host. On 2 of them there is no
+     pgrep, so whether an agent outlived it is unknown: db07 db08
+```
+
+`tx doctor` reports `pgrep=` per host, so you know before the run
+whether `stop` and `clean` will be able to verify themselves.
 
 ## Exit status
 

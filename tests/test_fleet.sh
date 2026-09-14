@@ -338,6 +338,49 @@ t_clean_asks_before_deleting_anything() {
     assert_file_exists "$FAKE_ROOT/web01$TX_REMOTE_DIR/run.json"
 }
 
+t_clean_does_not_claim_what_it_could_not_check() {
+    # `pgrep` absent looks exactly like `pgrep` finding nothing, so
+    # reading a missing one as "no agents" is how the run came to promise
+    # a clean fleet it never inspected. Three answers out of one exit
+    # status: 0 found, 1 none, 127 nothing to ask.
+    install_fake_ssh
+    plan="$(fleet_with_job web01 web02)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    await_fleet "$plan" 2 || fail "the fleet never finished"
+
+    # A host without procps.
+    printf '#!/bin/sh\nexit 127\n' > "$FAKE_BIN/pgrep"
+    chmod +x "$FAKE_BIN/pgrep"
+    run_tx clean --plan "$plan" --yes
+    assert_status 0 "$RUN_RC" "the directory still went, so this is not a failure"
+    assert_contains "$RUN_OUT" "UNVERIFIED"
+    assert_contains "$RUN_OUT" "could not be ruled out"
+    assert_not_contains "$RUN_OUT" "nothing of tx remains"
+    # It really did remove the working directory.
+    for h in web01 web02; do
+        assert_no_file "$FAKE_ROOT/$h$TX_REMOTE_DIR" "$h was not cleaned"
+    done
+}
+
+t_clean_says_so_plainly_when_it_could_check() {
+    install_fake_ssh
+    plan="$(fleet_with_job web01)"
+    run_tx start --plan "$plan" --start-in 1 --no-skew-check
+    await_fleet "$plan" 1 || fail "the job never finished"
+    run_tx clean --plan "$plan" --yes
+    assert_status 0 "$RUN_RC"
+    assert_contains "$RUN_OUT" "nothing of tx remains"
+    assert_not_contains "$RUN_OUT" "UNVERIFIED"
+}
+
+t_doctor_says_whether_the_fleet_can_be_checked() {
+    install_fake_ssh
+    plan="$(fleet_with_job web01)"
+    run_tx doctor --plan "$plan"
+    assert_contains "$RUN_OUT" "pgrep=" \
+        "doctor should say whether stop and clean can verify themselves"
+}
+
 t_a_dry_run_contacts_nothing() {
     install_fake_ssh
     plan="$(fleet_with_job web01 web02)"
@@ -367,5 +410,8 @@ run_test "stop keeps what the job made"        t_stop_ends_the_job_and_keeps_wha
 run_test "stop takes the children too"         t_stop_takes_the_jobs_children_with_it
 run_test "clean leaves nothing behind"         t_clean_leaves_nothing_behind
 run_test "clean asks first"                    t_clean_asks_before_deleting_anything
+run_test "clean does not overclaim"            t_clean_does_not_claim_what_it_could_not_check
+run_test "clean says so when it could check"   t_clean_says_so_plainly_when_it_could_check
+run_test "doctor reports pgrep"                t_doctor_says_whether_the_fleet_can_be_checked
 run_test "a dry run contacts nothing"          t_a_dry_run_contacts_nothing
 report_tests
