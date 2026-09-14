@@ -35,6 +35,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wave's own time bound); `--muster-cmd` names how to invoke muster when
   it is not `muster` on the `PATH`.
 
+- **`--max-bytes`, a ceiling on what a host hands back.** 100 MB per
+  file by default, `0` for none. A benchmark's results are usually small
+  and what this stops is the exception -- a core dump, a heap profile, a
+  log that ran away -- so until now a single runaway file could fill the
+  orchestrator's disk. It is applied on the host, so an oversized file
+  never crosses the network, and it is always named with its size rather
+  than silently dropped: a result you were told about is a decision, one
+  you were not is a surprise a week later.
+
 - **`tx run --batch --resume` picks a sweep up from the fleet's own
   record.** A ten-wave sweep can take hours and `tx run` has to stay
   alive to sequence it; if it does not, nothing local is lost, because
@@ -112,6 +121,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stops instead.
 
 ### Fixed
+
+- **`tx clean` claimed a clean fleet it had not checked.** It removes
+  the working directory and then asks `pgrep` whether any agent outlived
+  it -- but on a host without procps a missing `pgrep` returns 127,
+  which the old test read as "no agents found". So the run ended
+  "nothing of tx remains on the fleet" having verified nothing. Three
+  answers now come out of that one exit status (0 found, 1 none, 127
+  nothing to ask), and a host that could not be checked is named rather
+  than counted as clean. `tx doctor` reports `pgrep=` per host, so the
+  gap is visible before the run rather than after it.
 
 - **A host reported itself finished before its teardown had run**, so
   `tx run` collected while the teardown was still writing into `$TX_OUT`
