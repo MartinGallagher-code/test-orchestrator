@@ -91,11 +91,13 @@ agents to install, no packages, no root. Key-based SSH must already work
 | `tx summarize` | Who passed, who failed, who was slow — and how tight the start was. |
 | `tx clean` | Stop, then delete everything. No trace left — and it says so only if it could check. |
 
-And six more when you want them: `tx run` (all of the above in one
-shot, and `--batch N` to cover the fleet a few hosts at a time), `tx
-check` (will this plan work? no ssh needed), `tx doctor` (is the fleet
-ready?), `tx stop` (end the job, keep what it made), `tx logs` (collect
-the agents' own logs), and `tx hints` (goal → command).
+And more when you want them: `tx run` (all of the above in one shot, and
+`--batch N` to cover the fleet a few hosts at a time), `tx export` (the
+run as a floor-plan overlay — see [Draw it on the floor
+plan](#draw-it-on-the-floor-plan-tx-export)), `tx check` (will this plan
+work? no ssh needed), `tx doctor` (is the fleet ready?), `tx stop` (end
+the job, keep what it made), `tx logs` (collect the agents' own logs),
+and `tx hints` (goal → command).
 
 ---
 
@@ -474,6 +476,71 @@ tx -- ./bench.sh   [bench]
 
 An outlier is usually the reason a fleet benchmark is being run at all,
 so the hosts are named rather than just counted.
+
+---
+
+## Draw it on the floor plan (`tx export`)
+
+Which host was slow is a number; *which rack* it sits in is the question.
+`tx export` turns a run into an overlay for the
+[datacenter layout viewer](https://github.com/MartinGallagher-code/datacenter_visualization),
+which draws your floor from a `.dc` file and colours every node by a
+measured value — the same results file
+[`mx`](https://github.com/MartinGallagher-code/matrix_orchestrator) and
+[`iperf_orchestrator`](https://github.com/MartinGallagher-code/iperf_orchestrator)
+write, so a benchmark's timings sit on the floor beside the fabric's numbers:
+
+```bash
+tx run -d results                  # measure
+tx export >> results.tsv           # colour the floor plan with it
+```
+
+That is the whole integration. The viewer's results format is one sample
+per line — `test  target  value  [key=value ...]` — so the file is
+append-only: export after every run and the viewer aggregates the history
+however you ask it to (mean, p95, max, last).
+
+```text
+!test	tx_duration	unit=s higher=bad decimals=2 short=DUR label="Job wall-clock time"
+!test	tx_start_offset	unit=ms higher=bad decimals=1 short=SYNC label="Start offset from the armed instant"
+tx_duration	web12r06u15	541.2	run=nightly-7
+tx_start_offset	web12r06u15	31.4	run=nightly-7
+tx_state	web12r06u15	PASSED	run=nightly-7
+```
+
+One sample per host:
+
+| Overlay | What it is |
+|---|---|
+| `tx_duration` | the job's wall-clock time, seconds |
+| `tx_rel_median` | its runtime against the fleet's own median, % — 100% is normal for this fleet |
+| `tx_start_offset` | how far off the armed instant this host actually started, ms |
+| `tx_exit` | the job's exit code |
+| `tx_setup_exit` `tx_teardown_exit` | the setup and teardown exit codes, when they ran |
+| `tx_timed_out` | 1 if the host hit the timeout, 0 if not |
+| `tx_state` | `PASSED`, `FAILED`, `TIMEOUT`, `SETUP-FAILED`, `NEVER-RAN`, `RUNNING`, and `NO-DATA` for a host in the plan that never reported |
+
+**Reading a runtime without knowing the hardware.** `tx_rel_median` puts
+every host against the fleet's own median, on a diverging ramp where 100% is
+"normal for this fleet" — so a slow rack stands out whatever the absolute
+seconds are.
+
+**The sync map.** `tx_start_offset` is the one number only `tx` can draw:
+how far each host was from the instant they were all armed for. "They
+started together" stops being a claim and becomes a colour on the floor,
+where a late rack — a slow NTP, an overloaded hypervisor — shows.
+
+By default `tx export` reads the fleet the way `tx status` does. After a
+`tx clean`, or to re-export what you already brought back, point it at the
+collection instead:
+
+```bash
+tx export --from results >> results.tsv
+```
+
+`--names FILE` maps tx host names to the layout's, `--target-prefix DH1/A/`
+addresses nodes by path, `--run LABEL` tags every sample, and `--json`
+writes NDJSON for a pipeline rather than a person.
 
 ---
 

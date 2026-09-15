@@ -2421,6 +2421,384 @@ def run_from_muster(args, plan):
 
 
 # ---------------------------------------------------------------------------
+# export: a run as an overlay for the datacenter layout viewer
+# ---------------------------------------------------------------------------
+#
+# The viewer (github.com/MartinGallagher-code/datacenter_visualization) draws
+# a floor from a `.dc` layout and colours it from a results file: one sample
+# per line,
+#
+#     <test>  <target>  <value>  [key=value ...]
+#
+# tab separated, append-only, with `!test` lines carrying each overlay's
+# units and palette direction. `tx export >> results.tsv` after every run is
+# the whole integration; `--json` writes the same samples as NDJSON for a
+# pipeline rather than a person. It is the same file `mx` and iperf write, so
+# a floor can carry a benchmark's timings beside the fabric's numbers.
+#
+# The numbers are the ones `tx summarize` reads: each host's own run record,
+# by the report's own rules -- a blank is "not measured" and never zero, a
+# host still running has no duration to export rather than a misleading one,
+# and a host that never reported is said to be missing rather than counted as
+# a pass. That is why this is an export and not somebody else's importer: the
+# run record already knows what happened to each host, and this only recolours
+# it onto the floor.
+
+# (test, `!test` metadata). One sample per host, from each host's run record.
+EXPORT_HOST_TESTS = [
+    ("duration", 'unit=s higher=bad decimals=2 short=DUR label="Job wall-clock time"'),
+    # Each host's runtime against the fleet's own median, on a diverging ramp
+    # pinned at 0-200%: 100% is "normal for this fleet", so a slow outlier
+    # reddens without anyone knowing what the job should take on this hardware.
+    ("rel_median", 'unit=% higher=bad palette=rdbu min=0 max=200 agg=median decimals=0 short=REL label="Runtime vs fleet median"'),
+    # tx's signature number: how far each host was from the instant they were
+    # all armed for. It is what "they started together" means as a measurement
+    # rather than a hope, so it belongs on the floor where a late rack shows.
+    ("start_offset", 'unit=ms higher=bad decimals=1 short=SYNC label="Start offset from the armed instant"'),
+    ("exit", 'higher=bad decimals=0 short=EXIT label="Job exit code"'),
+    ("setup_exit", 'higher=bad decimals=0 short=SET label="Setup exit code"'),
+    ("teardown_exit", 'higher=bad decimals=0 short=TDN label="Teardown exit code"'),
+    ("timed_out", 'higher=bad min=0 max=1 decimals=0 short=TMO label="Hit the timeout"'),
+    ("state", 'agg=last short=STATE label="How this host finished"'),
+]
+
+EXPORT_META = dict(EXPORT_HOST_TESTS)
+
+# A results line is whitespace separated, and a double quote is how a value
+# with a space in it is written -- so neither can appear inside a field.
+BAD_IN_FIELD = ' \t\n\r"'
+
+
+def pct(part, whole):
+    """part as a percentage of whole, or None when whole is zero."""
+    return 100.0 * part / whole if whole else None
+
+
+def _median(values):
+    ordered = sorted(values)
+    n = len(ordered)
+    if not n:
+        return None
+    mid = n // 2
+    return ordered[mid] if n % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _fmt_num(value):
+    """A number for a results file: four significant digits, fixed notation.
+    `%g` would write a long runtime as 1.235e+04, which is correct and
+    unreadable in a file people grep."""
+    text = "%.4g" % value
+    if "e" in text or "E" in text:
+        text = "%.0f" % value
+    return text
+
+
+def _export_number(value):
+    """A finite float, or None when the value is missing or not a number."""
+    if value is None:
+        return None
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if num != num or num in (float("inf"), float("-inf")):
+        return None
+    return num
+
+
+def _meta_pairs(text):
+    """`unit=s higher=bad label="Job time"` -> a dict, quotes removed."""
+    pairs = {}
+    for token in shlex.split(text):
+        if "=" in token:
+            key, value = token.split("=", 1)
+            pairs[key] = value
+    return pairs
+
+
+def _load_names(path):
+    """`--names`: tx host name -> the name the layout knows it by.
+
+    One mapping per line, `txname target`, separated by whitespace or '='.
+    Blank lines and '#' comments are ignored, and a host the file does not
+    mention keeps its plan name -- so the file only carries the exceptions.
+    """
+    names = {}
+    try:
+        with open(path) as fh:
+            for lineno, raw in enumerate(fh, 1):
+                line = raw.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                parts = line.replace("=", " ").split()
+                if len(parts) != 2:
+                    die("%s line %d: want `txname target`, got %r"
+                        % (path, lineno, line))
+                names[parts[0]] = parts[1]
+    except (IOError, OSError) as exc:
+        die("cannot read %s: %s" % (path, exc))
+    return names
+
+
+class Overlay(object):
+    """The results file being built: `!test` declarations, then samples.
+
+    A test is declared the first time something is filed under it, so an
+    overlay never appears in the file with no data behind it.
+    """
+
+    def __init__(self, test_prefix="tx_", target_prefix="", names=None,
+                 run=None, meta_table=None):
+        self.meta_table = EXPORT_META if meta_table is None else meta_table
+        self.test_prefix = test_prefix
+        self.target_prefix = target_prefix
+        self.names = names or {}
+        self.run = run
+        self.meta = []          # [(test, "key=value ...")]
+        self.samples = []       # [(test, target, value, [key=value ...])]
+        self._declared = set()
+
+    def target(self, host):
+        """The layout's name for a tx host: mapped by --names, then prefixed
+        by --target-prefix. The viewer resolves a bare name, a path, or any
+        unique tail of a path, so `web01`, `R01/web01` and `DH1/A/R01/web01`
+        can all land on the same node."""
+        name = self.target_prefix + self.names.get(host, host)
+        if not name or any(c in name for c in BAD_IN_FIELD):
+            die("target %r: a results file is whitespace separated and quote "
+                "aware, so a target can hold neither (host %r)" % (name, host))
+        return name
+
+    def add(self, test, host, value, extras=()):
+        """File one sample. `None` is dropped: not measured is not zero."""
+        if value is None:
+            return
+        if not isinstance(value, str):
+            num = _export_number(value)
+            if num is None:
+                return
+            value = _fmt_num(num)
+        name = self.test_prefix + test
+        if test not in self._declared:
+            self._declared.add(test)
+            meta = self.meta_table.get(test)
+            if meta:
+                self.meta.append((name, meta))
+        extras = list(extras)
+        if self.run:
+            extras.append("run=%s" % self.run)
+        self.samples.append((name, self.target(host), value, extras))
+
+    def tsv_lines(self, with_meta=True):
+        out = []
+        if with_meta:
+            for test, meta in self.meta:
+                out.append("!test\t%s\t%s" % (test, meta))
+        for test, target, value, extras in self.samples:
+            out.append("\t".join([test, target, value] + extras))
+        return out
+
+    def json_lines(self, with_meta=True):
+        """NDJSON: one object per line, so concatenating two runs is still a
+        valid file -- which a top-level `[ ... ]` array would not be."""
+        out = []
+        if with_meta:
+            for test, meta in self.meta:
+                entry = {"!test": test}
+                entry.update(_meta_pairs(meta))
+                out.append(json.dumps(entry, sort_keys=True))
+        for test, target, value, extras in self.samples:
+            number = _export_number(value)
+            entry = {"test": test, "target": target,
+                     "value": value if number is None else number}
+            if extras:
+                entry["meta"] = _meta_pairs(" ".join(extras))
+            out.append(json.dumps(entry, sort_keys=True))
+        return out
+
+
+# How a host's run record becomes the one categorical overlay. Every other
+# overlay is a number that is either measured or not; this one is always
+# knowable, because "we never heard from it" is itself an answer.
+def _export_state(report, word):
+    if report is None:
+        # No record at all. The status word says why, and the difference
+        # matters to whoever has to go and look: a host that was never
+        # deployed is a plan that did not reach it, an unreachable one is a
+        # network or a key.
+        return {
+            "NOT-DEPLOYED": "NOT-RUN",
+            "NOT-RUNNING": "NOT-RUN",
+            "NOT-STARTED-YET": "RUNNING",
+            "UNREACHABLE": "UNREACHABLE",
+        }.get(word, "NO-DATA")
+    state = report.get("state")
+    if state == "done":
+        return "PASSED" if report.get("exit") == 0 else "FAILED"
+    if state == "timeout":
+        return "TIMEOUT"
+    if state == "setup-failed":
+        return "SETUP-FAILED"
+    if state == "launch-failed":
+        return "NEVER-RAN"
+    # armed / running / setup / tidying: still going.
+    return "RUNNING"
+
+
+def _read_collected_reports(path):
+    """`--from DIR`: {host: report} from the run.json files a collection holds.
+
+    `tx collect` writes each host's record as `tag~host~run.json`, so the
+    records are already here -- export reads them rather than ssh'ing the
+    fleet again. The host is taken from inside the record, not the filename,
+    so a tag or a host with an unusual character cannot misfile a sample.
+    """
+    if not os.path.isdir(path):
+        die("--from %s: not a directory (point it at a `tx collect` "
+            "directory)" % path)
+    reports = {}
+    for name in sorted(os.listdir(path)):
+        if not name.endswith(FLAT_SEP + REPORT_NAME) and name != REPORT_NAME:
+            continue
+        full = os.path.join(path, name)
+        try:
+            with open(full) as fh:
+                report = json.load(fh)
+        except (IOError, OSError, ValueError) as exc:
+            sys.stderr.write("[tx] export: skipping %s: %s\n" % (name, exc))
+            continue
+        host = report.get("host")
+        if not host:
+            sys.stderr.write("[tx] export: %s has no host field, skipping\n"
+                             % name)
+            continue
+        reports[host] = report
+    if not reports:
+        die("no run.json records in %s/ -- is it a `tx collect` directory?"
+            % path, code=1)
+    return reports
+
+
+def cmd_export(args):
+    have_plan = os.path.isfile(args.plan)
+    plan = load_plan(args.plan) if have_plan else None
+
+    # {host: (report-or-None, word-or-None)}, and the host order to walk.
+    entries = {}
+    if args.from_dir:
+        reports = _read_collected_reports(args.from_dir)
+        for host, report in reports.items():
+            entries[host] = (report, None)
+        # The plan, when there is one, is the roll call: a host it names that
+        # the collection has no record of never made it back.
+        hosts = list(plan.hosts) if plan else sorted(reports)
+        for host in hosts:
+            entries.setdefault(host, (None, "NO-DATA"))
+    else:
+        if plan is None:
+            die("plan not found: %s -- export reads the fleet named in the "
+                "plan; make one with `tx gen`, or read a collection with "
+                "`tx export --from DIR`" % args.plan)
+        seen = _collect_status(Fleet(plan, args))
+        hosts = list(plan.hosts)
+        for host in hosts:
+            _alive, report, word = seen[host]
+            entries[host] = (report, word)
+
+    if args.run and any(c in args.run for c in BAD_IN_FIELD):
+        die("--run %r: the label is written onto every sample line, so it "
+            "can hold no whitespace or quotes" % args.run)
+
+    out = Overlay(test_prefix=args.test_prefix,
+                  target_prefix=args.target_prefix,
+                  names=_load_names(args.names) if args.names else None,
+                  run=args.run)
+
+    # The fleet's own median runtime, which is what makes a host's time
+    # readable without knowing the hardware. One host is not a fleet, and a
+    # median of one would paint it a confident 100%.
+    durations = []
+    for host in hosts:
+        report, _word = entries[host]
+        if report is not None:
+            d = _export_number(report.get("duration"))
+            if d is not None and d > 0:
+                durations.append(d)
+    fleet_median = _median(durations) if len(durations) > 1 else None
+
+    ran = 0
+    for host in hosts:
+        report, word = entries[host]
+        out.add("state", host, _export_state(report, word))
+        if report is None:
+            continue
+        ran += 1
+        duration = _export_number(report.get("duration"))
+        if duration is not None:
+            out.add("duration", host, duration)
+            if fleet_median and duration > 0:
+                out.add("rel_median", host, pct(duration, fleet_median))
+        offset = _export_number(report.get("start_offset"))
+        if offset is not None:
+            out.add("start_offset", host, offset * 1000.0)
+        out.add("exit", host, _export_number(report.get("exit")))
+        out.add("setup_exit", host, _export_number(report.get("setup_exit")))
+        out.add("teardown_exit", host,
+                _export_number(report.get("teardown_exit")))
+        # Only meaningful once the job itself ran; before that "did it hit the
+        # timeout" has no answer, so it is left unmeasured rather than 0.
+        if report.get("state") in ("done", "timeout"):
+            out.add("timed_out", host, 1.0 if report.get("timed_out") else 0.0)
+
+    if not out.samples:
+        die("nothing to export -- no host has a run record yet (tx status)",
+            code=1)
+
+    missing = sorted(h for h in hosts if entries[h][0] is None)
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    tag = plan.tag if plan else (
+        next((r.get("tag") for r, _w in entries.values() if r), "") or "tx")
+    header = [
+        "# tx %s export -- %s, %d host(s) with a record, %d sample(s)"
+        % (VERSION, "[%s]" % tag, ran, len(out.samples)),
+        "# read %s at %s"
+        % ("collection %s" % args.from_dir if args.from_dir
+           else "the fleet", stamp),
+    ]
+    if missing:
+        header.append("# %d host(s) have no record (tx_state NO-DATA/NOT-RUN): "
+                      "%s" % (len(missing), " ".join(missing[:8])))
+    lines = (header +
+             (out.json_lines(not args.no_meta) if args.json
+              else out.tsv_lines(not args.no_meta)))
+
+    stdout = args.output in ("-", "")
+    if stdout:
+        for line in lines:
+            sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    else:
+        try:
+            with open(args.output, "a" if args.append else "w") as fh:
+                for line in lines:
+                    fh.write(line + "\n")
+        except (IOError, OSError) as exc:
+            die("cannot write %s: %s" % (args.output, exc))
+
+    tests = sorted(set(t for t, _target, _v, _e in out.samples))
+    sys.stderr.write("[tx] export: %d sample(s) over %d overlay(s) on %d "
+                     "host(s) -> %s\n"
+                     % (len(out.samples), len(tests), ran,
+                        "stdout" if stdout else args.output))
+    if missing:
+        sys.stderr.write("[tx] export: %d host(s) have no record, so only "
+                         "tx_state carries them (NO-DATA/NOT-RUN): %s\n"
+                         % (len(missing), " ".join(missing[:8])))
+    return 0
+
+
+
+# ---------------------------------------------------------------------------
 # gen, check, doctor
 # ---------------------------------------------------------------------------
 
@@ -2633,6 +3011,14 @@ HINTS = [
      "and checks them back in (done if they ran, released if nothing "
      "reached them) until the pool is empty. Several tx's can draw from "
      "one pool at once and never take the same item twice."),
+    ("colour a floor plan with the run",
+     "tx run -d results",
+     "tx export >> results.tsv",
+     "tx export writes the datacenter layout viewer's results file -- one "
+     "sample per host: duration, exit, how far each host was from the armed "
+     "instant, and a pass/fail state. Append after every run and the viewer "
+     "aggregates the history; `tx export --from results` re-exports a "
+     "collection without ssh."),
     ("prove the runs really were simultaneous",
      "tx summarize",
      "",
@@ -2869,6 +3255,38 @@ def build_parser():
                    help="with --batch, stop after a wave that did not start "
                         "or did not finish, instead of carrying on")
 
+    ex = sub.add_parser("export",
+                        help="the run as overlay samples for the datacenter "
+                             "layout viewer")
+    _add_fleet_flags(ex)
+    ex.add_argument("--from", dest="from_dir", metavar="DIR",
+                    help="read the run.json records a `tx collect` directory "
+                         "already holds, instead of asking the fleet -- no "
+                         "ssh, and it works after `tx clean`")
+    ex.add_argument("--output", "-o", default="-",
+                    help="results file to write ('-' for stdout, the default)")
+    ex.add_argument("--append", action="store_true",
+                    help="append to --output instead of replacing it: results "
+                         "files are append-only, so a run per append is a "
+                         "history the viewer can aggregate over")
+    ex.add_argument("--json", action="store_true",
+                    help="write NDJSON (one sample object per line) instead "
+                         "of the tab-separated form")
+    ex.add_argument("--names", metavar="FILE",
+                    help="map tx host names to the names the layout uses: "
+                         "one `txname target` per line")
+    ex.add_argument("--target-prefix", default="", metavar="STR",
+                    help="string prepended to every target, e.g. 'DH1/A/' "
+                         "when the layout addresses nodes by path")
+    ex.add_argument("--test-prefix", default="tx_", metavar="STR",
+                    help="string prepended to every test name, so tx overlays "
+                         "cannot collide with another tool's in the same "
+                         "results file (default: %(default)s)")
+    ex.add_argument("--run", metavar="LABEL",
+                    help="tag every sample with run=LABEL")
+    ex.add_argument("--no-meta", action="store_true",
+                    help="do not write the !test metadata lines")
+
     sub.add_parser("hints", help="a goal, and the command that gets it")
     sub.add_parser("help", help="every switch of every command, one page")
 
@@ -2928,7 +3346,7 @@ COMMANDS = {
     "start": cmd_start, "status": cmd_status, "collect": cmd_collect,
     "summarize": cmd_summarize, "stop": cmd_stop, "logs": cmd_logs,
     "clean": cmd_clean, "run": cmd_run, "hints": cmd_hints,
-    "agent": cmd_agent,
+    "export": cmd_export, "agent": cmd_agent,
 }
 
 
