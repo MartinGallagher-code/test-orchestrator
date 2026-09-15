@@ -8,5 +8,6 @@
 :hidden:
 
 cli
+publishing
 changelog
 ```
