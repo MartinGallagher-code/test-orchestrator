@@ -13,6 +13,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Ready to publish on PyPI, with docs on Read the Docs.** A trusted-
+  publishing workflow (`.github/workflows/publish.yml`, OIDC, no stored
+  token) builds an sdist and wheel on a GitHub Release, checks the metadata
+  with `twine`, and smoke-tests both console scripts (`tx`,
+  `test-orchestrator`) before uploading; it refuses a release tag that does
+  not match the version in the tree. `.readthedocs.yaml` builds the docs
+  (the CLI reference generated from the live parsers), and `PUBLISHING.md`
+  is the release runbook. `tests/test_version.sh` holds the one version in
+  its three places -- `pyproject.toml`, `__init__.py`, and `tx.py` (the
+  agent's own, stamped into every run record) -- in agreement.
+
 - **`tx export` turns a run into an overlay for the datacenter layout
   viewer.** The same tab-separated `!test`/sample results file `mx` and
   iperf write, so a benchmark's timings colour the floor plan beside the
