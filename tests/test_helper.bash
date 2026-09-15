@@ -14,7 +14,7 @@
 set -u
 
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-TX="${TX:-$REPO_ROOT/test_orchestrator/tx.py}"
+TX="${TX:-$REPO_ROOT/testing_orchestrator/tx.py}"
 export REPO_ROOT TX
 
 # ---- Per-test environment ---------------------------------------------------

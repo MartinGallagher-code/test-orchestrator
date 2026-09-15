@@ -5,7 +5,7 @@ SPDX-FileCopyrightText: 2026 Martin J. Gallagher
 
 # Publishing
 
-`test-orchestrator` publishes to PyPI through **trusted publishing** (OIDC),
+`testing-orchestrator` publishes to PyPI through **trusted publishing** (OIDC),
 so no API token is stored as a repository secret. The workflow in
 `.github/workflows/publish.yml` runs on a published GitHub Release, or
 manually via `workflow_dispatch`.
@@ -23,7 +23,7 @@ with `invalid-publisher`.
    | Field | Value |
    |---|---|
    | Owner | `MartinGallagher-code` |
-   | Repository | `test-orchestrator` |
+   | Repository | `testing-orchestrator` |
    | Workflow name | `publish.yml` |
    | Environment | `pypi` |
 
@@ -40,8 +40,8 @@ usual cause of `invalid-publisher`.
    suite (`tests/test_version.sh`) fails if they do not, and so does the
    publish workflow if the tag disagrees:
    - `pyproject.toml` → `version`
-   - `test_orchestrator/__init__.py` → `VERSION`
-   - `test_orchestrator/tx.py` → `VERSION`
+   - `testing_orchestrator/__init__.py` → `VERSION`
+   - `testing_orchestrator/tx.py` → `VERSION`
 
    `tx.py`'s is not redundant with the packaging version. `tx.py` is the
    whole tool in one file, and it is `scp`'d to every host and run there as
@@ -52,7 +52,7 @@ usual cause of `invalid-publisher`.
 
    ```bash
    sed -i 's/^VERSION = "1\.0\.0"$/VERSION = "1.1.0"/' \
-       test_orchestrator/__init__.py test_orchestrator/tx.py
+       testing_orchestrator/__init__.py testing_orchestrator/tx.py
    sed -i 's/^version = "1\.0\.0"$/version = "1.1.0"/' pyproject.toml
    ```
 
@@ -62,13 +62,13 @@ usual cause of `invalid-publisher`.
 4. Tag and push:
 
    ```bash
-   git tag -a v1.1.0 -m "test-orchestrator 1.1.0"
+   git tag -a v1.1.0 -m "testing-orchestrator 1.1.0"
    git push origin v1.1.0
    ```
 
 5. Publish a GitHub Release for that tag. That triggers `publish.yml`, which
    builds an sdist and a wheel, checks the metadata with `twine`, installs
-   the wheel and smoke-tests both console scripts (`tx`, `test-orchestrator`)
+   the wheel and smoke-tests both console scripts (`tx`, `testing-orchestrator`)
    before uploading.
 
 ## Checking before you tag
@@ -80,7 +80,7 @@ python -m twine check dist/*
 
 # The published artifact must be a working tool, not just valid metadata.
 python -m pip install dist/*.whl
-tx --version                 # and test-orchestrator --version agrees
+tx --version                 # and testing-orchestrator --version agrees
 tx hints
 ```
 

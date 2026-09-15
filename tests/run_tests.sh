@@ -15,7 +15,7 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-TX="$REPO_ROOT/test_orchestrator/tx.py"
+TX="$REPO_ROOT/testing_orchestrator/tx.py"
 export REPO_ROOT TX
 
 if [ ! -f "$TX" ]; then

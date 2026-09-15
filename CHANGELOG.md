@@ -17,7 +17,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   publishing workflow (`.github/workflows/publish.yml`, OIDC, no stored
   token) builds an sdist and wheel on a GitHub Release, checks the metadata
   with `twine`, and smoke-tests both console scripts (`tx`,
-  `test-orchestrator`) before uploading; it refuses a release tag that does
+  `testing-orchestrator`) before uploading; it refuses a release tag that does
   not match the version in the tree. `.readthedocs.yaml` builds the docs
   (the CLI reference generated from the live parsers), and `PUBLISHING.md`
   is the release runbook. `tests/test_version.sh` holds the one version in

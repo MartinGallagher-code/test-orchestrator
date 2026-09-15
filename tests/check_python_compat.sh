@@ -18,7 +18,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 fail=0
 
 echo "byte-compiling with $(python3 -V 2>&1)"
-for f in "$REPO_ROOT"/test_orchestrator/*.py; do
+for f in "$REPO_ROOT"/testing_orchestrator/*.py; do
     if python3 -m py_compile "$f"; then
         echo "  OK   $(basename "$f")"
     else
@@ -26,22 +26,22 @@ for f in "$REPO_ROOT"/test_orchestrator/*.py; do
         fail=1
     fi
 done
-rm -rf "$REPO_ROOT/test_orchestrator/__pycache__"
+rm -rf "$REPO_ROOT/testing_orchestrator/__pycache__"
 
 # Cheap textual guard for the constructs most likely to sneak in, so a
 # developer without vermin still gets told.
 echo "scanning for constructs newer than the 3.6 floor"
 if grep -nE "^\s*(from|import) (dataclasses|zoneinfo|graphlib)\b" \
-        "$REPO_ROOT"/test_orchestrator/*.py; then
+        "$REPO_ROOT"/testing_orchestrator/*.py; then
     echo "  FAIL: stdlib module newer than 3.6"
     fail=1
 fi
-if grep -nE ":=" "$REPO_ROOT"/test_orchestrator/*.py | grep -v "['\"].*:=" ; then
+if grep -nE ":=" "$REPO_ROOT"/testing_orchestrator/*.py | grep -v "['\"].*:=" ; then
     echo "  FAIL: walrus operator needs 3.8"
     fail=1
 fi
 if grep -nE "subprocess\.run\(|capture_output=|text=True" \
-        "$REPO_ROOT"/test_orchestrator/*.py; then
+        "$REPO_ROOT"/testing_orchestrator/*.py; then
     echo "  FAIL: subprocess API newer than 3.6"
     fail=1
 fi

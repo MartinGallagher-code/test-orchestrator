@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Martin J. Gallagher
-"""`python -m test_orchestrator` runs the same tool `tx` does."""
+"""`python -m testing_orchestrator` runs the same tool `tx` does."""
 
 import sys
 
