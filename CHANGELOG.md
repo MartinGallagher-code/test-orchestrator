@@ -13,6 +13,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`tx export` turns a run into an overlay for the datacenter layout
+  viewer.** The same tab-separated `!test`/sample results file `mx` and
+  iperf write, so a benchmark's timings colour the floor plan beside the
+  fabric's numbers. One sample per host from each host's run record:
+  `tx_duration`, `tx_rel_median` (runtime against the fleet's own median,
+  a slow rack reddening whatever the absolute seconds are),
+  `tx_start_offset` (how far off the armed instant each host actually
+  started -- the one overlay only tx can draw), `tx_exit`,
+  `tx_setup_exit`/`tx_teardown_exit`, `tx_timed_out`, and a categorical
+  `tx_state`. A blank field is "not measured" and never a flattering
+  zero, and a host in the plan that never reported is named `NO-DATA`
+  rather than dropped. Reads the fleet like `tx status` by default, or a
+  `tx collect` directory with `--from` (no ssh, and it works after
+  `tx clean`); `--json` writes NDJSON, and `--names`/`--target-prefix`/
+  `--test-prefix`/`--run` reshape the lines for the layout and for
+  sharing a results file with another tool.
+
 - **`tx run --muster` draws the work from a binnacle muster pool instead
   of the plan's host list.** `--batch` walks a fleet the plan names;
   `--muster` walks a pool `muster` is keeping, which hands items out
