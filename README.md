@@ -3,9 +3,9 @@ SPDX-License-Identifier: GPL-3.0-or-later
 SPDX-FileCopyrightText: 2026 Martin J. Gallagher
 -->
 
-# test-orchestrator (`tx`)
+# testing-orchestrator (`tx`)
 
-[![CI](https://github.com/MartinGallagher-code/test-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/MartinGallagher-code/test-orchestrator/actions/workflows/ci.yml)
+[![CI](https://github.com/MartinGallagher-code/testing-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/MartinGallagher-code/testing-orchestrator/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
 Run **one benchmark on a whole fleet at once**, started at the same
@@ -59,18 +59,18 @@ removes itself.
 ## Install
 
 ```bash
-pip install test-orchestrator
+pip install testing-orchestrator
 ```
 
-That puts `tx` on your `PATH` (and `test-orchestrator` as an alias). No
+That puts `tx` on your `PATH` (and `testing-orchestrator` as an alias). No
 dependencies — the package is standard-library only.
 
 Or skip installing entirely: `tx` is one self-contained file.
 
 ```bash
-git clone https://github.com/MartinGallagher-code/test-orchestrator
-cd test-orchestrator
-./test_orchestrator/tx.py hints
+git clone https://github.com/MartinGallagher-code/testing-orchestrator
+cd testing-orchestrator
+./testing_orchestrator/tx.py hints
 ```
 
 **Requirements.** Python 3.6+ and `ssh`/`scp` on the machine you drive

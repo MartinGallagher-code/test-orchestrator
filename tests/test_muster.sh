@@ -8,7 +8,7 @@
 # that an item that ran is checked in done and one nothing reached is put
 # back, and that a second worker's held items are left strictly alone.
 #
-# test-orchestrator does not depend on binnacle, and CI has no `muster` on
+# testing-orchestrator does not depend on binnacle, and CI has no `muster` on
 # it, so a small faithful double stands in -- the same idea as the fake
 # ssh/scp shims. It implements only the contract tx uses (take/done/
 # release/status, leases, the ticket's lease header), which is exactly

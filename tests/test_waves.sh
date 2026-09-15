@@ -302,7 +302,7 @@ import sys; sys.path.insert(0, sys.argv[1])
 import tx
 print(tx.poll_interval(0), tx.poll_interval(60), tx.poll_interval(600),
       tx.poll_interval(99999), tx.poll_interval(99999, 5.0))
-' "$REPO_ROOT/test_orchestrator")"
+' "$REPO_ROOT/testing_orchestrator")"
     read -r at0 at60 at600 far pinned <<< "$out"
     assert_eq "2.0" "$at0" "it should start responsive"
     assert_eq "6.0" "$at60" "and grow with the wait"

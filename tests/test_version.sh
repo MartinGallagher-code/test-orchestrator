@@ -3,7 +3,7 @@
 # Copyright (C) 2026 Martin J. Gallagher
 #
 # One version, in three places. `pyproject.toml` is what PyPI publishes;
-# `test_orchestrator/__init__.py` is what `import test_orchestrator` reports;
+# `testing_orchestrator/__init__.py` is what `import testing_orchestrator` reports;
 # and `tx.py`'s own `VERSION` is the one that actually travels -- the agent is
 # scp'd to every host and run there, and it stamps that number into each run
 # record as `agent_version`. A release that bumps one and forgets another
@@ -21,7 +21,7 @@ pyproject_version() {
 # A module's VERSION = "..." line, read without importing (the 3.6 floor
 # means we cannot rely on this interpreter being able to import the agent).
 module_version() {
-    sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$REPO_ROOT/test_orchestrator/$1" \
+    sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$REPO_ROOT/testing_orchestrator/$1" \
         | head -n 1
 }
 

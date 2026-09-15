@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Martin J. Gallagher
-"""test_orchestrator -- run one job on a whole fleet at once, and get the
+"""testing_orchestrator -- run one job on a whole fleet at once, and get the
 results back.
 
 The whole tool is `tx.py`: a single self-contained file, because it is

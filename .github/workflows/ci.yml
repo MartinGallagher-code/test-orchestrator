@@ -59,7 +59,7 @@ jobs:
           # The '-' suffix means "3.6 or later"; a bare --target=3.6 asks
           # for code that needs *exactly* 3.6 and fails on anything older.
           vermin --eval-annotations --violations --target=3.6- \
-            test_orchestrator/*.py
+            testing_orchestrator/*.py
 
       # Hosted runners no longer offer a 3.6 toolchain, so use the
       # container. Checkout runs on the host, so there is no node20 issue.

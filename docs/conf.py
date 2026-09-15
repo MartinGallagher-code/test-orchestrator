@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # SPDX-FileCopyrightText: 2026 Martin J. Gallagher
-"""Sphinx configuration for test_orchestrator.
+"""Sphinx configuration for testing_orchestrator.
 
 Two principles, both anti-drift:
 
@@ -19,9 +19,9 @@ DOCS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(DOCS_DIR)
 sys.path.insert(0, REPO_ROOT)
 
-from test_orchestrator import tx  # noqa: E402
+from testing_orchestrator import tx  # noqa: E402
 
-project = "test-orchestrator"
+project = "testing-orchestrator"
 author = "Martin J. Gallagher"
 copyright = "2026, Martin J. Gallagher"  # noqa: A001 - sphinx's name for it
 version = tx.VERSION
@@ -36,7 +36,7 @@ master_doc = "index"
 exclude_patterns = ["_build"]
 
 html_theme = "sphinx_rtd_theme"
-html_title = "test-orchestrator %s" % tx.VERSION
+html_title = "testing-orchestrator %s" % tx.VERSION
 html_theme_options = {"collapse_navigation": False}
 
 # The included README carries repo-relative links (LICENSE, tests/...)
