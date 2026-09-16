@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Martin J. Gallagher
+# SPDX-FileCopyrightText: 2026 Martin J. Gallagher
+
 #
 # One version, in three places. `pyproject.toml` is what PyPI publishes;
 # `testing_orchestrator/__init__.py` is what `import testing_orchestrator` reports;
