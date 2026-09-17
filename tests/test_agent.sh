@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Martin J. Gallagher
+# SPDX-FileCopyrightText: 2026 Martin J. Gallagher
+
 #
 # The agent: the half of tx that runs on the servers. It is what makes a
 # job's result a result -- the environment it runs in, the bound it runs

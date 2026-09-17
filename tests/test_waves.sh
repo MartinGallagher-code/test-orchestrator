@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Martin J. Gallagher
+# SPDX-FileCopyrightText: 2026 Martin J. Gallagher
+
 #
 # Coverage mode: the whole fleet, a few hosts at a time. What has to hold
 # is that every host is reached, each wave is still simultaneous in

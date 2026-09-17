@@ -6,7 +6,8 @@ SPDX-FileCopyrightText: 2026 Martin J. Gallagher
 # testing-orchestrator (`tx`)
 
 [![CI](https://github.com/MartinGallagher-code/testing-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/MartinGallagher-code/testing-orchestrator/actions/workflows/ci.yml)
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](https://www.gnu.org/licenses/gpl-3.0.html)
+[![REUSE status](https://api.reuse.software/badge/github.com/MartinGallagher-code/testing-orchestrator)](https://api.reuse.software/info/github.com/MartinGallagher-code/testing-orchestrator)
 
 Run **one benchmark on a whole fleet at once**, started at the same
 instant on every machine, and get every result back in one directory
@@ -606,6 +607,24 @@ Each is the default for the matching flag: `TX_PLAN`, `TX_SERVERS`,
 
 ---
 
-## Licence
+## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+Copyright (C) 2026 Martin J. Gallagher
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program. If not, see <https://www.gnu.org/licenses/>.
+
+Full text: the `LICENSE` file at the repository root, or
+<https://www.gnu.org/licenses/gpl-3.0.html> — SPDX identifier
+`GPL-3.0-or-later`. This repository follows the
+[REUSE Specification](https://reuse.software/): source files carry SPDX
+copyright and licence headers, and the licence text lives in `LICENSES/`.

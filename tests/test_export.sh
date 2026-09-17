@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Martin J. Gallagher
+# SPDX-FileCopyrightText: 2026 Martin J. Gallagher
+
 #
 # `tx export`: run records -> overlay samples for the datacenter layout
 # viewer (github.com/MartinGallagher-code/datacenter_visualization). The same
